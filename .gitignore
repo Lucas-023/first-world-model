@@ -6,8 +6,7 @@
 
 # Ignora os outputs gerados
 results/
-dataset_jogo
+dataset_jogo/
 
 # (Opcional) Ignora a pasta específica do run dentro de models, 
 # mas deixa o Git ver models/encoder/ e models/dynamics/
-models/VQVAE_PONG/

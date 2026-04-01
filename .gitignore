@@ -1,12 +1,40 @@
-# ── Pesos e Imagens (Já estão seguros no Hugging Face!) ──
-# Ignora os arquivos de pesos em qualquer lugar do projeto
+# =========================
+# Arquivos Específicos Excluídos
+# =========================
+upload_to_hf.py
+upload_dataset.py
+*.sh
+
+# =========================
+# Dados e Pesos (Vão para o Hugging Face, não para o GitHub)
+# =========================
 *.pt
 *.pth
-*.ckpt
+*.png
+*.jpg
+*.jpeg
+*.csv
+# Descomente as linhas abaixo e coloque o nome da sua pasta de imagens se quiser bloquear a pasta inteira
+# dataset/
+# models/
 
-# Ignora os outputs gerados
-results/
-dataset_jogo/
+# =========================
+# Ambientes Virtuais (VENV)
+# =========================
+.venv/
+venv/
+env/
+.env
 
-# (Opcional) Ignora a pasta específica do run dentro de models, 
-# mas deixa o Git ver models/encoder/ e models/dynamics/
+# =========================
+# Python Caches
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Sistema
+# =========================
+.DS_Store
+Thumbs.db

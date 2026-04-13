@@ -8,7 +8,7 @@ import argparse
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from torchvision.utils import make_grid
-from models.encoder.dataset import PongDataset
+from models.encoder.dataset import CarRacingDataset
 from models.encoder.board import Board
 from models.encoder.utils import save_images, setup_logging
 from models.encoder.modules import VQVAE  # ajuste o caminho se necessário
@@ -27,7 +27,7 @@ def train(args):
     ckpt_path = os.path.join(save_dir, "ckpt.pt")
 
     # Dataset & Dataloader
-    dataset    = PongDataset(args.dataset_path, image_size=args.image_size)
+    dataset    = CarRacingDataset(args.dataset_path, image_size=args.image_size)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,

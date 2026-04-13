@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from vector_quantize_pytorch import VectorQuantize
 
 
 class ResidualBlock(nn.Module):
@@ -127,49 +128,20 @@ class Decoder(nn.Module):
 
         return torch.sigmoid(x)
     
-class VectorQuantizer(nn.Module):
-    def __init__(self, num_embeddings = 512, embedding_dim = 128, commitment_cost =0.25):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.num_embeddings = num_embeddings
-        self.commitment_cost = commitment_cost
-
-        self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-
-        self.embedding.weight.data.uniform_(-1/self.num_embeddings, 1/self.num_embeddings)
-
-    def forward(self, inputs):
-        inputs = inputs.permute(0, 2, 3, 1).contiguous()
-        input_shape = inputs.shape
-
-        flat_input = inputs.view(-1, self.embedding_dim)
-
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
-                    + torch.sum(self.embedding.weight**2, dim=1)
-                    - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
-        
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-
-        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
-        quantized = torch.matmul(encodings, self.embedding.weight).view(input_shape)
-
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs) # Puxa o Encoder (Commitment)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach()) # Puxa o Catálogo (Codebook)
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-
-        quantized = inputs + (quantized - inputs).detach()
-
-        quantized = quantized.permute(0, 3, 1, 2).contiguous()
-        
-        return quantized, loss, encoding_indices.view(input_shape[0], input_shape[1], input_shape[2])
 
 
 class VQVAE(nn.Module):
     def __init__(self, in_channels=3, latent_dim=128, num_embeddings=512):
         super().__init__()
         self.encoder = Encoder(in_channels, latent_dim=latent_dim)
-        self.vq = VectorQuantizer(num_embeddings, latent_dim)
+        self.vq = VectorQuantize(
+            dim = latent_dim,
+            codebook_size = num_embeddings,
+            decay = 0.8,             
+            commitment_weight = 0.25, 
+            kmeans_init = True,      
+            use_cosine_sim = True    
+        )
         self.decoder = Decoder(latent_dim, out_channels=in_channels)
 
     def forward(self, x):

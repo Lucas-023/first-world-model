@@ -66,104 +66,98 @@ class Block(nn.Module):
         return x
 
 class WorldModelConfig:
-    def __init__(self, **kwargs):
-        self.block_size = kwargs.get('block_size', 320)       # 5 frames * 64 tokens
-        self.vocab_size = kwargs.get('vocab_size', 512)       # Igual ao num_embeddings do VQ-VAE
-        self.action_vocab_size = kwargs.get('action_vocab_size', 4) # Quantidade de ações do jogo
-        self.n_layer = kwargs.get('n_layer', 6)
-        self.n_head = kwargs.get('n_head', 8)
-        self.n_embd = kwargs.get('n_embd', 512)
-        self.dropout = kwargs.get('dropout', 0.1)
-        self.bias = kwargs.get('bias', False)
-
+    def __init__(self, vocab_size, n_embd=256, n_head=8, n_layer=6, 
+                 tokens_per_frame=64, frames_per_seq=5, dropout=0.1):
+        self.vocab_size = vocab_size
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_layer = n_layer
+        self.dropout = dropout
+        self.tokens_per_frame = tokens_per_frame
+        self.frames_per_seq = frames_per_seq
+        self.block_size = (tokens_per_frame + 1) * frames_per_seq
+        self.bias = True
 class WorldModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            w_act = nn.Embedding(config.action_vocab_size, config.n_embd),
+            tok_emb = nn.Embedding(config.vocab_size, config.n_embd),
+            pos_emb = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ln_f = LayerNorm(config.n_embd, config.bias),
         ))
         
+        # 1. Action Encoder: Transforma [Volante, Acel, Freio] -> n_embd
+        self.action_encoder = nn.Linear(3, config.n_embd)
+
+        # 2. Cabeças de Saída
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # Weight Tying
+        self.reward_head = nn.Linear(config.n_embd, 1) # Preve um número (recompensa)
+        self.done_head = nn.Linear(config.n_embd, 1)   # Preve probabilidade (fim de jogo)
+
+        # Peso amigável: amarra os pesos da lm_head com a tok_emb (padrão GPT)
+        self.transformer.tok_emb.weight = self.lm_head.weight 
+
+    def forward(self, img_tokens, actions, targets_img=None, targets_reward=None, targets_done=None):
+        device = img_tokens.device
+        b, t_seq, f_tokens = img_tokens.size() # [Batch, Frames_Seq, 64]
         
-        # CABEÇA DO DONE (Prevê apenas 1 valor: 0 ou 1)
-        self.done_head = nn.Linear(config.n_embd, 1)
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, actions=None, targets=None, targets_done=None):
-        device = idx.device
-        b, t = idx.size()
+        # --- PASSO 1: EMBEDDINGS ---
+        # Imagens: [B, T_seq, 64, Emb]
+        tok_emb = self.transformer.tok_emb(img_tokens) 
+        # Ações: [B, T_seq, 1, Emb]
+        act_emb = self.action_encoder(actions).unsqueeze(2) 
         
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        # --- PASSO 2: INTERCALAR (A MÁGICA) ---
+        # Concatenamos a ação após os 64 tokens de cada frame
+        # Resultado: [B, T_seq, 65, Emb]
+        combined = torch.cat([tok_emb, act_emb], dim=2)
+        # Planificamos para a sequência longa que o GPT gosta: [B, T_seq * 65, Emb]
+        x = combined.view(b, -1, self.config.n_embd)
 
-        tok_emb = self.transformer.wte(idx) # Visão: [B, T, n_embd]
-        pos_emb = self.transformer.wpe(pos) # Tempo/Espaço: [T, n_embd]
-        
-        x = tok_emb + pos_emb
-        
-        if actions is not None:
-            act_emb = self.transformer.w_act(actions) # [B, frames_per_seq, n_embd]
-            
-            # TRUQUE MÁGICO: Espalha a ação do frame para todos os 64 tokens dele
-            frames_per_seq = actions.size(1)
-            tokens_per_frame = t // frames_per_seq
-            act_emb_expanded = act_emb.repeat_interleave(tokens_per_frame, dim=1) # [B, T, n_embd]
-            
-            x = x + act_emb_expanded
+        # Adiciona posição
+        pos = torch.arange(0, x.size(1), dtype=torch.long, device=device)
+        x = self.transformer.drop(x + self.transformer.pos_emb(pos))
 
-        # Passa pelos blocos do Transformer
+        # Passa pelos blocos de Atenção
         for block in self.transformer.h:
             x = block(x)
-            
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # 1. Erro da Imagem (Previsão de Tokens)
+        # --- PASSO 3: CABEÇAS E LOSS ---
+        if targets_img is not None:
+            # 3.1 Previsão de Imagem (Próximo Token)
             logits = self.lm_head(x)
-            loss_img = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            loss = loss_img
             
-            # 2. Erro do Fim do Episódio (Done)
-            if targets_done is not None:
-                done_logits = self.done_head(x).squeeze(-1) # [B, T]
-                
-                frames_per_seq = targets_done.size(1)
-                tokens_per_frame = t // frames_per_seq
-                
-                # Pegamos apenas o último token de cada frame (ex: índices 63, 127, 191...)
-                last_token_indices = torch.arange(
-                    tokens_per_frame - 1, t, tokens_per_frame, device=device
-                )
-                
-                done_preds = done_logits[:, last_token_indices] # [B, frames_per_seq]
-                
-                # Calcula o erro usando Binary Cross Entropy
-                loss_done = F.binary_cross_entropy_with_logits(done_preds, targets_done)
-                
-                # Junta os dois erros
-                loss = loss_img + loss_done
+            # Ajustamos as saídas para prever o PRÓXIMO item da sequência
+            # targets_img deve vir no formato intercalado também ou calculamos o shift
+            # Para simplificar: loss de reconstrução dos tokens de imagem
+            loss_img = F.cross_entropy(logits[:, :-1, :].reshape(-1, logits.size(-1)), 
+                                      # Aqui você precisará de uma lógica para alinhar targets
+                                      targets_img.reshape(-1))
+
+            # 3.2 Previsão de Reward e Done (Baseadas no token da Ação)
+            # Pegamos a saída do Transformer na posição onde entrou a ação (índices 64, 129...)
+            action_indices = torch.arange(self.config.tokens_per_frame, x.size(1), 
+                                          self.config.tokens_per_frame + 1, device=device)
+            
+            action_outputs = x[:, action_indices, :] # [B, T_seq, Emb]
+            
+            reward_preds = self.reward_head(action_outputs).squeeze(-1)
+            done_preds = self.done_head(action_outputs).squeeze(-1)
+
+            loss_reward = F.mse_loss(reward_preds, targets_reward)
+            loss_done = F.binary_cross_entropy_with_logits(done_preds, targets_done)
+
+            # A loss total é a soma balanceada
+            loss = loss_img + (10.0 * loss_reward) + (5.0 * loss_done)
+            return logits, loss
+        
         else:
-            # Modo de imaginação (Inferência)
-            logits = self.lm_head(x[:, [-1], :])
-            loss = None
-
-        return logits, loss
-
+            return self.lm_head(x[:, [-1], :]), None
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]

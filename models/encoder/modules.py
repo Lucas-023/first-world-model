@@ -139,19 +139,19 @@ class VQVAE(nn.Module):
             codebook_size = num_embeddings,
             decay = 0.8,             
             commitment_weight = 0.25, 
-            kmeans_init = True,      
-            use_cosine_sim = True    
+            kmeans_init = False,      # <--- A MUDANÇA É APENAS AQUI!
+            use_cosine_sim = True,
+            accept_image_fmap = True 
         )
         self.decoder = Decoder(latent_dim, out_channels=in_channels)
-
     def forward(self, x):
-        #Encoder espreme a imagem
+        # 1. Passa pelo Encoder
         z = self.encoder(x)
         
-        #Quantizador substitui pelos vetores do catálogo
-        quantized, vq_loss, indices = self.vq(z)
+        # 3. Passa pelo VQ (Nota: a ordem correta de retorno é quantizado, indices, loss)
+        quantized, indices, vq_loss = self.vq(z)
         
-        #Decoder reconstrói a imagem a partir do catálogo
+        # 5. Reconstrói a imagem
         x_recon = self.decoder(quantized)
         
         return x_recon, vq_loss, indices

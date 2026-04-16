@@ -1,40 +1,5 @@
-# =========================
-# Arquivos Específicos Excluídos
-# =========================
-upload_to_hf.py
-upload_dataset.py
-*.sh
+*
 
-# =========================
-# Dados e Pesos (Vão para o Hugging Face, não para o GitHub)
-# =========================
-*.pt
-*.pth
-*.png
-*.jpg
-*.jpeg
-*.csv
-# Descomente as linhas abaixo e coloque o nome da sua pasta de imagens se quiser bloquear a pasta inteira
-# dataset/
-# models/
+!*/
 
-# =========================
-# Ambientes Virtuais (VENV)
-# =========================
-.venv/
-venv/
-env/
-.env
-
-# =========================
-# Python Caches
-# =========================
-__pycache__/
-*.py[cod]
-*$py.class
-
-# =========================
-# Sistema
-# =========================
-.DS_Store
-Thumbs.db
+!*.py

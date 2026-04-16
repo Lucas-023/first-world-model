@@ -5,7 +5,7 @@ import torchvision
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from models.encoder.dataset import PongDataset  # dataset.py já existe no seu encoder/
+from models.encoder.dataset import CarRacingDataset  # dataset.py já existe no seu encoder/
 
 
 def setup_logging(run_name):
@@ -32,7 +32,7 @@ def get_data(args):
         transforms.ToTensor()                              # [0, 1]
     ])
 
-    dataset = PongDataset(args.dataset_path, transform=transform)
+    dataset = CarRacingDataset(args.dataset_path, transform=transform)
 
     dataloader = DataLoader(
         dataset,

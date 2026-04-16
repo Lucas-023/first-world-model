@@ -154,10 +154,11 @@ class WorldModel(nn.Module):
 
             # A loss total é a soma balanceada
             loss = loss_img + (10.0 * loss_reward) + (5.0 * loss_done)
-            return logits, loss
+            return logits, (loss, loss_img, loss_reward, loss_done)
         
         else:
-            return self.lm_head(x[:, [-1], :]), None
+            # Em vez de apenas o último [-1], retorne os últimos 64 para a imagem
+            return self.lm_head(x[:, -64:, :]), None
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
@@ -168,3 +169,45 @@ class WorldModel(nn.Module):
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
         return optimizer
+    
+    @torch.no_grad()
+    def generate(self, img_tokens, actions, max_steps=20):
+        model_device = next(self.parameters()).device
+        
+        # Garante formato [1, 1, 64]
+        curr_img_tokens = img_tokens.to(model_device)
+        if curr_img_tokens.dim() == 2:
+            curr_img_tokens = curr_img_tokens.unsqueeze(1)
+            
+        all_frames = [curr_img_tokens]
+
+        for t in range(max_steps):
+            # 1. Filtra as ações para o tamanho atual da sequência
+            curr_actions = actions[:, :len(all_frames), :].to(model_device)
+            
+            # 2. Concatena os frames: [1, T_atual, 64]
+            input_imgs = torch.cat(all_frames, dim=1) 
+            
+            # 3. Forward pass (usa o modo inferência do seu modelo)
+            # O seu forward sem targets retorna: self.lm_head(x[:, [-1], :])
+            # MAS para gerar 64 tokens, precisamos de mais do que o índice [-1]!
+            
+            # --- MUDANÇA CRUCIAL AQUI ---
+            # Vamos chamar o processamento do transformer diretamente ou 
+            # ajustar o forward para não retornar apenas o último token.
+            logits, _ = self.forward(input_imgs, curr_actions)
+            
+            # Se o seu lm_head retorna [B, Seq, Vocab], queremos os últimos 64
+            # que correspondem à previsão do próximo frame de imagem.
+            next_frame_logits = logits[:, -64:, :] 
+            
+            # 4. Argmax para pegar os IDs dos tokens
+            next_frame_tokens = torch.argmax(next_frame_logits, dim=-1) # [1, 64]
+            
+            # 5. Garantir que o formato seja [1, 1, 64] para o próximo torch.cat
+            if next_frame_tokens.dim() == 2:
+                next_frame_tokens = next_frame_tokens.unsqueeze(1)
+            
+            all_frames.append(next_frame_tokens)
+
+        return torch.cat(all_frames, dim=1)

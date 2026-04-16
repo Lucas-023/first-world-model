@@ -2,76 +2,54 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from torchvision import transforms
 
-class CarRacingSequenceDataset(Dataset):
-    def __init__(self, folder_path, seq_len=5, max_frames_per_episode=300):
-        """
-        seq_len: Quantos frames o Transformer vai ver de uma vez (janela de contexto)
-        """
-        self.folder_path = folder_path
-        self.files = [f for f in os.listdir(folder_path) if f.endswith('.npz')]
+class CarRacingTokenDataset(Dataset):
+    def __init__(self, folder_path, seq_len=20, max_files=None):
+        super().__init__()
         self.seq_len = seq_len
-        self.max_frames = max_frames_per_episode
         
-        # Se o vídeo tem 300 frames e a sequência tem 5, 
-        # temos 296 "janelas" possíveis de 5 frames dentro de um único vídeo.
-        self.samples_per_file = self.max_frames - self.seq_len + 1
+        files = [f for f in os.listdir(folder_path) if f.endswith('.npz')]
+        if max_files: files = files[:max_files]
+            
+        print(f"⏳ Carregando {len(files)} episódios convertidos em TOKENS para a RAM...")
         
-        self.transform = transforms.ToTensor()
+        self.episodes = []
+        self.valid_indices = [] 
         
-        # Sistema de Cache para não explodir a leitura do HD
-        self.cached_file_idx = -1
-        self.cached_data = {}
+        for ep_id, f in enumerate(files):
+            data = np.load(os.path.join(folder_path, f))
+            self.episodes.append({
+                'tokens': data['tokens'],  # Agora carregamos 'tokens' ao invés de 'obs'
+                'actions': data['actions'],
+                'rewards': data['rewards'],
+                'dones': data['dones']
+            })
+            
+            total_frames = len(data['tokens'])
+            if total_frames >= seq_len:
+                for start_frame in range(total_frames - seq_len + 1):
+                    self.valid_indices.append((ep_id, start_frame))
+                    
+        print(f"✅ Dataset na RAM! Total de sequências de {seq_len} frames: {len(self.valid_indices)}")
 
     def __len__(self):
-        # Total de "vídeos curtos" que podemos extrair de todo o dataset
-        return len(self.files) * self.samples_per_file
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
-        # Descobre de qual arquivo tirar e em qual frame começar
-        file_idx = idx // self.samples_per_file
-        start_frame = idx % self.samples_per_file
-        
-        if file_idx >= len(self.files):
-            file_idx = len(self.files) - 1
-
-        # Abre o arquivo .npz apenas se mudamos de episódio
-        if file_idx != self.cached_file_idx:
-            file_path = os.path.join(self.folder_path, self.files[file_idx])
-            data = np.load(file_path)
-            
-            # Carrega tudo para a memória RAM (Cache)
-            self.cached_data['obs'] = data['obs']
-            self.cached_data['actions'] = data['actions']
-            self.cached_data['rewards'] = data['rewards']
-            self.cached_data['dones'] = data['dones']
-            self.cached_file_idx = file_idx
-
-        # Fim da nossa janela (ex: começa no 10, termina no 15)
+        ep_id, start_frame = self.valid_indices[idx]
         end_frame = start_frame + self.seq_len
         
-        # Proteção caso o carro tenha batido e o episódio seja menor que 300 frames
-        total_real_frames = len(self.cached_data['obs'])
-        if end_frame > total_real_frames:
-            end_frame = total_real_frames
-            start_frame = max(0, end_frame - self.seq_len)
-
-        # Corta a fatia exata de tempo (Sequência)
-        obs_seq = self.cached_data['obs'][start_frame:end_frame]
-        act_seq = self.cached_data['actions'][start_frame:end_frame]
-        rew_seq = self.cached_data['rewards'][start_frame:end_frame]
-        done_seq = self.cached_data['dones'][start_frame:end_frame]
+        ep_data = self.episodes[ep_id]
         
-        # Converter Imagens (T, 64, 64, 3) para Tensor (T, 3, 64, 64) entre 0.0 e 1.0
-        obs_tensors = torch.stack([self.transform(img) for img in obs_seq])
+        # O Tensor de imagens sumiu! Agora passamos os tokens diretamente
+        tokens_seq = ep_data['tokens'][start_frame:end_frame]
+        act_seq = ep_data['actions'][start_frame:end_frame]
+        rew_seq = ep_data['rewards'][start_frame:end_frame]
+        done_seq = ep_data['dones'][start_frame:end_frame]
         
-        # Converter Ações (T, 3) para Tensor
+        tokens_tensors = torch.tensor(tokens_seq, dtype=torch.long)
         act_tensors = torch.tensor(act_seq, dtype=torch.float32)
-        
-        # Converter Recompensas e Dones (T,) para Tensor
         rew_tensors = torch.tensor(rew_seq, dtype=torch.float32)
         done_tensors = torch.tensor(done_seq, dtype=torch.float32)
 
-        # O DataLoader agora cospe as 4 variáveis para o train_gpt.py
-        return obs_tensors, act_tensors, rew_tensors, done_tensors
+        return tokens_tensors, act_tensors, rew_tensors, done_tensors

@@ -27,13 +27,14 @@ def train(args):
     ckpt_path = os.path.join(save_dir, "ckpt.pt")
 
     # Dataset & Dataloader
-    dataset    = CarRacingDataset(args.dataset_path, image_size=args.image_size)
+    dataset    = CarRacingDataset(args.dataset_path, max_files=2000)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=32,
         pin_memory=True,
+        persistent_workers = True
     )
 
     # Modelo
@@ -117,7 +118,7 @@ def train(args):
         torch.save(checkpoint, ckpt_path)
 
         # ── Imagens de teste a cada 25 épocas ─────────────────────
-        if epoch % 25 == 0 or epoch == args.epochs - 1:
+        if epoch % 5 == 0 or epoch == args.epochs - 1:
             print("🎨 Gerando imagens de reconstrução...")
             model.eval()
             with torch.no_grad():

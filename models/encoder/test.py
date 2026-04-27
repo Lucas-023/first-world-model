@@ -1,4 +1,6 @@
 import os
+from xml.parsers.expat import model
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
 import argparse
@@ -6,7 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 
 # Ajuste os imports abaixo para bater com a estrutura de pastas do seu projeto
-from models.encoder.dataset import PongDataset
+from models.encoder.dataset import CarRacingDataset
 from models.encoder.modules import VQVAE
 
 def evaluate_vqvae(args):
@@ -27,12 +29,12 @@ def evaluate_vqvae(args):
         raise FileNotFoundError(f"❌ Checkpoint não encontrado em: {ckpt_path}")
     
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"])   
     model.eval() # Modo de avaliação (desliga dropout, etc)
     print(f"✅ Modelo carregado da época {checkpoint.get('epoch', 'N/A')}")
 
     # 3. Carregar um batch de teste
-    dataset = PongDataset(args.dataset_path, image_size=args.image_size)
+    dataset = CarRacingDataset(args.dataset_path, max_files=200)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
     images = next(iter(dataloader)).to(device)
 
@@ -82,7 +84,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--run_name',     type=str, default="VQVAE_PONG")
     # Coloque o caminho real da sua pasta de imagens aqui no 'default'
-    parser.add_argument('--dataset_path', type=str, default="./sua_pasta_de_imagens") 
+    parser.add_argument('--dataset_path', type=str, default="./dataset_carracing", help="Caminho para a pasta com os .npz") 
     parser.add_argument('--batch_size',   type=int, default=32)
     parser.add_argument('--image_size',   type=int, default=64)
     parser.add_argument('--latent_dim',   type=int, default=128)

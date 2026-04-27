@@ -20,9 +20,16 @@ def load_models(vqvae_path, gpt_path, device):
     # Exemplo (ajuste os argumentos para os que você usou):
     vqvae = VQVAE().to(device) 
     # Primeiro criamos o objeto de configuração
-    config = WorldModelConfig(vocab_size=512, block_size=320, action_vocab_size=5)
+    config = WorldModelConfig(
+        vocab_size=512,
+        n_embd=256,
+        n_head=8,
+        n_layer=4,
+        tokens_per_frame=64,
+        frames_per_seq=5
+    )
     # Depois passamos ele para o WorldModel
-    gpt = WorldModel(config).to(device) 
+    gpt = WorldModel(config).to(device)
 
     # Carrega os dicionários de pesos salvos
     ckpt_vqvae = torch.load(vqvae_path, map_location=device, weights_only=True)

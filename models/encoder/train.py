@@ -1,4 +1,6 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -27,12 +29,12 @@ def train(args):
     ckpt_path = os.path.join(save_dir, "ckpt.pt")
 
     # Dataset & Dataloader
-    dataset    = CarRacingDataset(args.dataset_path, max_files=2000)
+    dataset    = CarRacingDataset(args.dataset_path, max_files=200)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=32,
+        num_workers=4,
         pin_memory=True,
         persistent_workers = True
     )
@@ -47,7 +49,8 @@ def train(args):
     # Otimizador + loss + scaler
     optimizer    = optim.AdamW(model.parameters(), lr=args.lr)
     recon_loss_fn = nn.MSELoss()          # ou BCELoss se preferir pixel-wise
-    scaler       = GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
+
 
     start_epoch = 0
     if os.path.exists(ckpt_path):
@@ -74,7 +77,8 @@ def train(args):
             images = images.to(device)          
             optimizer.zero_grad()
 
-            with autocast():
+            with torch.amp.autocast('cuda'):
+
                 x_recon, vq_loss, _ = model(images)
 
                 # Loss total = reconstrução + penalidade do codebook

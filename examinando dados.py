@@ -1,53 +1,31 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
+import glob
 import os
 
-SAVE_DIR = "dataset_carracing"
+DATASET_DIR = "dataset_breakout_rl"
 
-def examine_data(episode_id=0):
-    filename = os.path.join(SAVE_DIR, f"episode_{episode_id:04d}.npz")
-    
-    if not os.path.exists(filename):
-        print(f"Arquivo {filename} não encontrado!")
-        return
+npz_files = sorted(glob.glob(os.path.join(DATASET_DIR, "*.npz")))
+print(f"Total de arquivos .npz: {len(npz_files)}\n")
 
-    # Carrega os dados
-    data = np.load(filename)
-    frames = data['obs']
-    actions = data['actions']
-    
-    print(f"Examinando {filename}")
-    print(f"Total de frames: {frames.shape[0]}")
-    print(f"Shape das imagens: {frames.shape[1:]} (deve ser 64, 64, 3)")
-    print(f"Shape das ações: {actions.shape[1:]} (deve ser 3,)")
-    
-    # Exibe as métricas da primeira ação
-    print(f"Ação inicial - Volante: {actions[0][0]:.2f}, Acel: {actions[0][1]:.2f}, Freio: {actions[0][2]:.2f}")
+if len(npz_files) == 0:
+    print("Nenhum arquivo encontrado!")
+    exit()
 
-    # Configura o player de vídeo com Matplotlib
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.axis('off')
-    
-    # Renderiza o primeiro frame
-    img_display = ax.imshow(frames[0])
-    
-    # Função de atualização para a animação
-    def update(frame_idx):
-        img_display.set_array(frames[frame_idx])
-        # Mostra os comandos no título do gráfico para conferência
-        act = actions[frame_idx]
-        ax.set_title(f"Frame {frame_idx} | Vol: {act[0]:.2f} | Acel: {act[1]:.2f} | Fr: {act[2]:.2f}")
-        return [img_display]
+rewards_total = []
+frames_total = []
 
-    # Cria a animação (interval=50 significa 50 milissegundos entre frames, aprox 20 FPS)
-    ani = animation.FuncAnimation(
-        fig, update, frames=len(frames), interval=50, blit=False
-    )
-    
-    plt.tight_layout()
-    plt.show()
+for npz_path in npz_files:
+    data = np.load(npz_path)
+    total_reward = data['rewards'].sum()
+    n_frames = len(data['obs'])
+    rewards_total.append(total_reward)
+    frames_total.append(n_frames)
+    print(f"{os.path.basename(npz_path)} | frames={n_frames} | reward={total_reward:.1f} | obs_shape={data['obs'][0].shape}")
 
-if __name__ == "__main__":
-    # Escolha o ID do episódio que deseja examinar
-    examine_data(episode_id=0)
+print(f"\n--- RESUMO ({len(npz_files)} episódios) ---")
+print(f"Reward médio:      {np.mean(rewards_total):.1f}")
+print(f"Reward max:        {np.max(rewards_total):.1f}")
+print(f"Reward min:        {np.min(rewards_total):.1f}")
+print(f"Frames médio:      {np.mean(frames_total):.0f}")
+print(f"Frames total:      {sum(frames_total):,}")
+print(f"Tamanho estimado:  {sum(frames_total) * 64 * 64 / 1024 / 1024:.1f} MB")

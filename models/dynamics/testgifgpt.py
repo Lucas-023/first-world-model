@@ -42,8 +42,15 @@ def load_models(vqvae_path, gpt_path, device):
     vqvae = VQVAE().to(device) 
     
     # 2. Carrega GPT com a sua configuração do CarRacing
-    config = WorldModelConfig(vocab_size=512, block_size=320, action_vocab_size=5)
-    gpt = WorldModel(config).to(device) 
+    config = WorldModelConfig(
+        vocab_size=512,
+        n_embd=256,
+        n_head=8,
+        n_layer=4,
+        tokens_per_frame=64,
+        frames_per_seq=5
+    )
+    gpt = WorldModel(config).to(device)
 
     # 3. Carrega os checkpoints
     ckpt_vqvae = torch.load(vqvae_path, map_location=device, weights_only=True)

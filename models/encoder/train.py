@@ -34,9 +34,9 @@ def train(args):
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=0,
         pin_memory=True,
-        persistent_workers = True
+        persistent_workers = False if os.name == 'nt' else True,  # Windows tem problemas com workers persistentes
     )
 
     # Modelo

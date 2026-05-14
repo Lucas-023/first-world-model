@@ -1,67 +1,67 @@
+"""
+CarRacingTokenDataset
+=====================
+Carrega episodios ja tokenizados pelo extract_tokens.py e os divide
+em janelas de comprimento fixo para treinar o World Model.
+
+IMPORTANTE: os rewards chegam JA DISCRETIZADOS do extract_tokens.py.
+Nao discretizar de novo aqui.
+
+Cada item devolvido pelo __getitem__:
+    tokens  : (seq_len, 64)  torch.long  — indices visuais [0, vocab_img)
+    actions : (seq_len,)     torch.long  — [0, vocab_action) = [0, 4]
+    rewards : (seq_len,)     torch.long  — [0, vocab_reward) = [0, 20]
+    dones   : (seq_len,)     torch.long  — 0 ou 1
+"""
+
 import os
+import glob
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+
 class CarRacingTokenDataset(Dataset):
-    def __init__(self, folder_path, seq_len=20, max_files=None):
-        super().__init__()
+
+    def __init__(self, dataset_path: str, seq_len: int = 20):
         self.seq_len = seq_len
+        self.chunks  = []
 
-        self.NUM_REWARD_BINS = 21
-        self.NUM_ACTION_BINS = 11
+        files = sorted(glob.glob(os.path.join(dataset_path, "*.npz")))
+        print(f"Carregando {len(files)} episodios de tokens...")
 
-        files = [f for f in os.listdir(folder_path) if f.endswith('.npz')]
-        if max_files:
-            files = files[:max_files]
+        for f in files:
+            npz = np.load(f, allow_pickle=False)
 
-        self.episodes = []
-        self.valid_indices = []
+            tokens  = npz["tokens"].astype(np.int64)   # (T, 64)
+            actions = npz["actions"].astype(np.int64)  # (T,)
+            rewards = npz["rewards"].astype(np.int64)  # (T,) — JA discretizado
+            dones   = npz["dones"].astype(np.int64)    # (T,)
 
-        for ep_id, f in enumerate(files):
-            data = np.load(os.path.join(folder_path, f))
+            T = tokens.shape[0]
+            if T < seq_len:
+                continue
 
-            tokens = data['tokens']
-            actions = data['actions']
-            rewards = data['rewards']
-            dones = data['dones'].astype(np.int64)
+            # Janelas sem sobreposicao de tamanho seq_len
+            for start in range(0, T - seq_len + 1, seq_len):
+                end = start + seq_len
+                self.chunks.append((
+                    tokens [start:end],   # (seq_len, 64)
+                    actions[start:end],   # (seq_len,)
+                    rewards[start:end],   # (seq_len,)
+                    dones  [start:end],   # (seq_len,)
+                ))
 
-            # reward
-            rewards = np.clip(rewards, -10, 10)
-            rewards = ((rewards + 10) / 20 * (self.NUM_REWARD_BINS - 1)).astype(np.int64)
-
-            # action
-            act = actions.copy()
-            act[:, 0] = np.clip(act[:, 0], -1, 1)
-            act[:, 1:] = np.clip(act[:, 1:], 0, 1)
-
-            act_bins = np.zeros_like(act, dtype=np.int64)
-            act_bins[:, 0] = ((act[:, 0] + 1) / 2 * (self.NUM_ACTION_BINS - 1)).astype(np.int64)
-            act_bins[:, 1:] = (act[:, 1:] * (self.NUM_ACTION_BINS - 1)).astype(np.int64)
-
-            self.episodes.append({
-                "tokens": tokens,
-                "actions": act_bins,
-                "rewards": rewards,
-                "dones": dones
-            })
-
-            T = len(tokens)
-            for start in range(T - seq_len):
-                self.valid_indices.append((ep_id, start))
+        print(f"Total de sequencias: {len(self.chunks)}")
 
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.chunks)
 
     def __getitem__(self, idx):
-        ep_id, start = self.valid_indices[idx]
-        end = start + self.seq_len
-
-        ep = self.episodes[ep_id]
-
-        z = torch.tensor(ep["tokens"][start:end], dtype=torch.long)
-        a = torch.tensor(ep["actions"][start:end], dtype=torch.long)
-        r = torch.tensor(ep["rewards"][start:end], dtype=torch.long)
-        d = torch.tensor(ep["dones"][start:end], dtype=torch.long)
-
-        return z, a, r, d
+        tok, act, rew, don = self.chunks[idx]
+        return (
+            torch.from_numpy(tok).long(),   # (seq_len, 64)
+            torch.from_numpy(act).long(),   # (seq_len,)
+            torch.from_numpy(rew).long(),   # (seq_len,)
+            torch.from_numpy(don).long(),   # (seq_len,)
+        )

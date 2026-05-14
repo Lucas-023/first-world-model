@@ -158,37 +158,17 @@ class VQVAE(nn.Module):
 
     def decode_indices(self, indices):
         """
-        Converts discrete token indices back into a continuous image.
-        
-        Args:
-            indices: Tensor of shape [batch_size, num_tokens] (e.g., [1, 64])
-                     or [batch_size, height, width] (e.g., [1, 8, 8]).
-        Returns:
-            reconstructed_images: Tensor of shape [batch_size, channels, H, W]
+        indices: (B, 64) long  — indices do codebook
+        retorna: (B, 3, 64, 64) float32
         """
-        import math
-        
-        # 1. Flatten indices if they come in as 2D spatial grids (e.g., B x 8 x 8 -> B x 64)
-        if indices.dim() == 3:
-            indices = indices.view(indices.size(0), -1)
-            
         batch_size, seq_len = indices.shape
-        
-        # 2. Look up the continuous embeddings from the codebook
-        # FIX APPLIED HERE: using self.vq instead of self.quantizer
-        z_q = self.vq.embedding(indices) # Shape: [B, seq_len, embedding_dim]
-        
-        # 3. Reshape the 1D sequence back into a 2D spatial grid for the CNN decoder
-        embedding_dim = z_q.shape[-1]
-        grid_size = int(math.sqrt(seq_len)) # e.g., sqrt(64) = 8
-        
-        # Reshape to [B, H, W, C]
-        z_q = z_q.view(batch_size, grid_size, grid_size, embedding_dim)
-        
-        # Permute to [B, C, H, W] because PyTorch convolutions expect channels first
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
-        
-        # 4. Pass through the decoder to get the final image pixels
-        reconstructed_images = self.decoder(z_q)
-        
-        return reconstructed_images
+        grid_size = int(seq_len ** 0.5)  # 8
+
+        # Reshape para (B, H, W) que o get_codes_from_indices espera
+        indices_2d = indices.view(batch_size, grid_size, grid_size)
+
+        # Busca embeddings — retorna (B, latent_dim, H, W) direto, ja canal-first
+        z_q = self.vq.get_codes_from_indices(indices_2d)  # (B, 128, 8, 8)
+
+        # Passa pelo decoder
+        return self.decoder(z_q)

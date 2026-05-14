@@ -186,7 +186,7 @@ def train_gpt(args):
         batch = next(iter(dataloader))
         img_tokens, actions, rewards, dones = [b.to(device) for b in batch]
 
-        for step in range(300):
+        for step in range(3000):
             seq    = build_sequence(img_tokens, actions, rewards, dones, config)
             inputs  = seq[:, :-1]   # (B, T*67 - 1)
             targets = seq[:, 1:]    # (B, T*67 - 1) — proximo token para cada posicao
@@ -196,7 +196,7 @@ def train_gpt(args):
             loss.backward()
             optimizer.step()
 
-            if step % 50 == 0:
+            if step % 500 == 0:
                 print(f"  step {step:>3} | loss {loss.item():.4f}")
 
         print("Overfit test concluido. Se a loss caiu para < 1.0, o modelo esta aprendendo.")
@@ -247,7 +247,6 @@ def train_gpt(args):
                     vqvae.eval()
 
                     with torch.no_grad():
-                        # Usa os primeiros 10 frames como seed e gera mais 20
                         seed_len  = 10 * config.tokens_per_frame
                         seed_seq  = last_seq[0:1, :seed_len]
                         generated = model.generate(seed_seq, max_new_tokens=20 * config.tokens_per_frame)
@@ -257,14 +256,17 @@ def train_gpt(args):
                         reshaped = generated[0, :n_frames * config.tokens_per_frame].view(
                             n_frames, config.tokens_per_frame
                         )
-                        # Extrai so os 64 tokens visuais e remove offset
-                        img_tok = reshaped[:, :64] - config.img_offset
-                        img_tok = torch.clamp(img_tok, 0, config.vocab_img - 1)
+                        img_tok_raw = reshaped[:, :64] - config.img_offset
+                        fora_do_range = ((img_tok_raw < 0) | (img_tok_raw >= config.vocab_img)).float().mean()
+                        print(f"[DIAGNOSTICO] Tokens fora do range de imagem: {fora_do_range:.1%}")
 
-                        dream = vqvae.decode_indices(img_tok)  # (n_frames, 3, 64, 64)
+                        img_tok = torch.clamp(img_tok_raw, 0, config.vocab_img - 1)
+                        dream = vqvae.decode_indices(img_tok)
+                        print(f"[DIAGNOSTICO] dream shape: {dream.shape}, min: {dream.min():.3f}, max: {dream.max():.3f}")
                         grid  = make_grid(dream.cpu(), nrow=10, normalize=True, value_range=(0, 1))
+                        print(f"[DIAGNOSTICO] grid shape: {grid.shape}")
                         board.log_image("Imagination/Dream", grid, epoch)
-
+                        print("[DIAGNOSTICO] log_image chamado com sucesso")
                     del vqvae
                     torch.cuda.empty_cache()
             except Exception as e:
@@ -296,11 +298,11 @@ if __name__ == "__main__":
     p.add_argument("--batch_size",     type=int,   default=16)
     p.add_argument("--vocab_size",     type=int,   default=512)
     p.add_argument("--frames_per_seq", type=int,   default=20)
-    p.add_argument("--n_embd",         type=int,   default=256)
+    p.add_argument("--n_embd",         type=int,   default=512)
     p.add_argument("--n_head",         type=int,   default=8)
-    p.add_argument("--n_layer",        type=int,   default=6)
+    p.add_argument("--n_layer",        type=int,   default=8)
     p.add_argument("--dropout",        type=float, default=0.1)
-    p.add_argument("--lr",             type=float, default=3e-4)
+    p.add_argument("--lr",             type=float, default=1e-4)
     p.add_argument("--overfit_test",   action="store_true")
     p.add_argument("--device",         type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")

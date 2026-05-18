@@ -17,7 +17,7 @@ Os arquivos ficam em:
 
 Uso:
     python collect.py --model_path models/best_model.zip --n_episodes 500
-    python collect.py --model_path models/best_model.zip --n_episodes 200 --epsilon 0.05
+    python collect.py --model_path agente_coleta/ppo_carracing_final.zip --n_episodes 200 --epsilon 0.05
 """
 
 import argparse
@@ -110,10 +110,6 @@ class FrameStackChannels(gym.Wrapper):
         return self._get_obs(), reward, terminated, truncated, info
 
 
-# ---------------------------------------------------------------------------
-# Criacao do ambiente de coleta
-# Diferente do treino: sem EarlyTermination (queremos episodios completos)
-# ---------------------------------------------------------------------------
 
 def make_collection_env(
     frame_skip: int = 4,
@@ -132,11 +128,8 @@ def make_collection_env(
     return env
 
 
-# ---------------------------------------------------------------------------
-# Coleta
-# ---------------------------------------------------------------------------
 
-def collect(args):
+def collect(args, epsilon, n_episodes):
     os.makedirs(args.data_dir, exist_ok=True)
 
     # Verifica quantos episodios ja existem (para retomar coleta)
@@ -153,23 +146,19 @@ def collect(args):
         seed=args.seed,
     )
 
-    # Carrega o agente — sem env pois vamos chamar predict() manualmente
     model = PPO.load(args.model_path, device="cuda")
 
     print(f"\nColetando {args.n_episodes} episodios -> '{args.data_dir}'")
-    print(f"Epsilon (exploracao aleatoria): {args.epsilon:.0%}")
+    print(f"Epsilon (exploracao aleatoria): {epsilon:.0%}")
     print(f"Frame skip: {args.frame_skip}  |  Frame stack: {args.frame_stack}\n")
 
     total_steps = 0
     rewards_log = []
 
-    for ep in range(args.n_episodes):
+    for ep in range(n_episodes):
         ep_idx = start_ep + ep
 
-        # Buffers do episodio
-        # Salvamos o frame ATUAL (sem stack) para o world model:
-        # shape (C, H, W) = (3, 64, 64) — mais leve e mais util
-        obs_buf     = []   # frames individuais (3, 64, 64)
+        obs_buf     = []  
         action_buf  = []
         reward_buf  = []
         done_buf    = []
@@ -177,20 +166,18 @@ def collect(args):
         stacked_obs, _ = env.reset(seed=args.seed + ep_idx)
 
         # Extrai o frame atual (ultimos C canais do stack)
-        # O stack e (C*n_stack, H, W); os ultimos C canais sao o frame mais recente
         C = 3  # canais RGB
         done = False
         ep_reward = 0.0
 
         while not done:
             # Frame atual = ultimos 3 canais do stack
-            current_frame = stacked_obs[-C:, :, :]   # (3, 64, 64)
+            current_frame = stacked_obs[-C:, :, :]  
 
             # Acao: epsilon-greedy sobre a politica do agente
-            if np.random.rand() < args.epsilon:
+            if np.random.rand() < epsilon:
                 action = env.action_space.sample()
             else:
-                # predict() espera (1, obs_shape) — adiciona batch dim
                 action, _ = model.predict(
                     stacked_obs[np.newaxis],
                     deterministic=True,
@@ -243,9 +230,6 @@ def collect(args):
     print(f"{'='*60}\n")
 
 
-# ---------------------------------------------------------------------------
-# Inspecao rapida do dataset
-# ---------------------------------------------------------------------------
 
 def inspect(data_dir: str):
     """Mostra um resumo dos dados ja coletados."""
@@ -274,9 +258,6 @@ def inspect(data_dir: str):
     print(f"{'='*60}\n")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(description="Coleta de dados para World Model")
@@ -290,14 +271,12 @@ def parse_args():
     p.add_argument("--epsilon",     type=float, default=0.02,
                    help="Fracao de acoes aleatorias para diversidade (default: 0.02)")
 
-    # Devem ser identicos ao treino
     p.add_argument("--frame_skip",  type=int, default=4)
     p.add_argument("--frame_stack", type=int, default=4)
     p.add_argument("--img_size",    type=int, default=64)
     p.add_argument("--crop_rows",   type=int, default=12)
     p.add_argument("--seed",        type=int, default=0)
 
-    # Inspecao
     p.add_argument("--inspect",     action="store_true",
                    help="So inspeciona o dataset existente, sem coletar")
 
@@ -309,5 +288,25 @@ if __name__ == "__main__":
 
     if args.inspect:
         inspect(args.data_dir)
+
     else:
-        collect(args)
+        epsilon_schedule = [
+            (0.02, 0.25),
+            (0.05, 0.25),
+            (0.10, 0.20),
+            (0.20, 0.15),
+            (0.35, 0.10),
+            (0.60, 0.05),
+        ]
+
+        total_episodes = args.n_episodes
+
+        for epsilon, fraction in epsilon_schedule:
+            n_eps = int(total_episodes * fraction)
+
+            print("\n" + "=" * 60)
+            print(f"Coletando com epsilon = {epsilon:.2f}")
+            print(f"Episodios = {n_eps}")
+            print("=" * 60)
+
+            collect(args, epsilon=epsilon, n_episodes=n_eps)

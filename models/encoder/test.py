@@ -82,7 +82,7 @@ def evaluate_vqvae(args):
 if __name__ == '__main__':
     print("🚀 Iniciando o script de teste...")
     parser = argparse.ArgumentParser()
-    parser.add_argument('--run_name',     type=str, default="VQVAE_PONG")
+    parser.add_argument('--run_name',     type=str, default="VQVAE")
     # Coloque o caminho real da sua pasta de imagens aqui no 'default'
     parser.add_argument('--dataset_path', type=str, default="./dataset_carracing", help="Caminho para a pasta com os .npz") 
     parser.add_argument('--batch_size',   type=int, default=32)

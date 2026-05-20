@@ -5,161 +5,290 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import logging
+
 from tqdm import tqdm
+
 import argparse
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader
+
+from torch.utils.data import DataLoader
+
 from torchvision.utils import make_grid
+from torchvision.utils import save_image
+
 from models.encoder.dataset import CarRacingDataset
-from models.encoder.board import Board
-from models.encoder.utils import save_images, setup_logging
-from models.encoder.modules import VQVAE  # ajuste o caminho se necessário
+from models.encoder.modules import VQVAE
+
+
+def setup_logging(run_name):
+
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
+
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s: %(message)s",
+        level=logging.INFO,
+        datefmt="%I:%M:%S"
+    )
+
+
+def save_images(images, path):
+
+    images = images.clamp(0, 1)
+
+    save_image(images, path)
 
 
 def train(args):
+
     setup_logging(args.run_name)
+
     device = args.device
+
     torch.backends.cudnn.benchmark = True
 
-    # Diretórios
-    save_dir     = os.path.join("models",   args.run_name)
-    results_dir  = os.path.join("results",  args.run_name)
-    os.makedirs(save_dir,    exist_ok=True)
-    os.makedirs(results_dir, exist_ok=True)
-    ckpt_path = os.path.join(save_dir, "ckpt.pt")
+    save_dir = os.path.join(
+        "models",
+        args.run_name
+    )
 
-    # Dataset & Dataloader
-    dataset    = CarRacingDataset(args.dataset_path, max_files=200)
+    results_dir = os.path.join(
+        "results",
+        args.run_name
+    )
+
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(results_dir, exist_ok=True)
+
+    ckpt_path = os.path.join(
+        save_dir,
+        "ckpt.pt"
+    )
+
+    dataset = CarRacingDataset(
+        args.dataset_path,
+        max_files=args.max_files
+    )
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers = False if os.name == 'nt' else True,  # Windows tem problemas com workers persistentes
+        persistent_workers=args.num_workers > 0
     )
 
-    # Modelo
     model = VQVAE(
         in_channels=3,
         latent_dim=args.latent_dim,
-        num_embeddings=args.num_embeddings,
+        num_embeddings=args.num_embeddings
     ).to(device)
 
-    # Otimizador + loss + scaler
-    optimizer    = optim.AdamW(model.parameters(), lr=args.lr)
-    recon_loss_fn = nn.MSELoss()          # ou BCELoss se preferir pixel-wise
-    scaler = torch.amp.GradScaler('cuda')
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(0.9, 0.95)
+    )
 
+    recon_loss_fn = nn.MSELoss()
+
+    scaler = torch.amp.GradScaler("cuda")
 
     start_epoch = 0
-    if os.path.exists(ckpt_path):
-        print(f"🔄 Checkpoint encontrado em: {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if "scaler_state_dict" in checkpoint:
-            scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        print(f"✅ Treino retomado da época {start_epoch}")
 
-    # TensorBoard
-    board       = Board(run_name=args.run_name, enabled=True)
-    global_step = 0
+    if os.path.exists(ckpt_path):
+
+        print(f"\n🔄 Checkpoint encontrado: {ckpt_path}")
+
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location=device
+        )
+
+        model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+
+        scaler.load_state_dict(
+            checkpoint["scaler_state_dict"]
+        )
+
+        start_epoch = checkpoint["epoch"] + 1
+
+        print(
+            f"✅ Retomando da época {start_epoch}"
+        )
 
     for epoch in range(start_epoch, args.epochs):
-        logging.info(f"Starting epoch {epoch}:")
+
         model.train()
-        pbar         = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}")
-        epoch_losses = []
+
+        pbar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch}"
+        )
+
+        losses = []
 
         for images in pbar:
-            images = images.to(device)          
-            optimizer.zero_grad()
 
-            with torch.amp.autocast('cuda'):
+            images = images.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda"):
 
                 x_recon, vq_loss, _ = model(images)
 
-                # Loss total = reconstrução + penalidade do codebook
-                recon_loss = recon_loss_fn(x_recon, images)
-                loss       = recon_loss + vq_loss
+                recon_loss = recon_loss_fn(
+                    x_recon,
+                    images
+                )
+
+                loss = recon_loss + vq_loss
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                1.0
+            )
+
             scaler.step(optimizer)
+
             scaler.update()
 
-            # ── Logging por batch ──────────────────────────────────
-            epoch_losses.append(loss.item())
-            pbar.set_postfix(
-                Loss=f"{loss.item():.5f}",
-                Recon=f"{recon_loss.item():.5f}",
-                VQ=f"{vq_loss.item():.5f}",
-            )
-            board.log_scalar("Loss/Batch",       loss.item(),        global_step)
-            board.log_scalar("Loss/Recon_Batch",  recon_loss.item(), global_step)
-            board.log_scalar("Loss/VQ_Batch",     vq_loss.item(),    global_step)
-            global_step += 1
+            losses.append(loss.item())
 
-        # ── Logging por época ──────────────────────────────────────
-        avg_loss = sum(epoch_losses) / len(epoch_losses)
-        print(f"\n📊 Época {epoch} — Loss Médio: {avg_loss:.6f}")
-        board.log_scalar("Loss/Epoca", avg_loss, epoch)
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "recon": f"{recon_loss.item():.4f}",
+                "vq": f"{vq_loss.item():.4f}"
+            })
 
-        #if epoch % 10 == 0:
-            #board.log_layer_gradients(model, epoch)
+        avg_loss = sum(losses) / len(losses)
 
-        # ── Salvar checkpoint ──────────────────────────────────────
+        print(
+            f"\n📊 Epoch {epoch} "
+            f"| loss={avg_loss:.6f}"
+        )
+
         checkpoint = {
-            "epoch":                epoch,
-            "model_state_dict":     model.state_dict(),
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict":    scaler.state_dict(),
-            "loss":                 avg_loss,
+            "scaler_state_dict": scaler.state_dict()
         }
-        torch.save(checkpoint, ckpt_path)
 
-        # ── Imagens de teste a cada 25 épocas ─────────────────────
-        if epoch % 5 == 0 or epoch == args.epochs - 1:
-            print("🎨 Gerando imagens de reconstrução...")
+        torch.save(
+            checkpoint,
+            ckpt_path
+        )
+
+        if epoch % 5 == 0:
+
             model.eval()
+
             with torch.no_grad():
-                # Pega um batch fixo do dataloader para visualizar
-                sample_images = next(iter(dataloader))[:16].to(device)
+
+                sample_images = next(
+                    iter(dataloader)
+                )[:8].to(device)
+
                 x_recon, _, _ = model(sample_images)
 
-            # Salva lado a lado: original | reconstruída
-            comparison = torch.cat([sample_images[:8], x_recon[:8]], dim=0)
-            save_images(comparison, os.path.join(results_dir, f"{epoch}.jpg"))
-            torch.save(checkpoint, os.path.join(save_dir, f"ckpt_epoch_{epoch}.pt"))
+                sample_vis = sample_images.clamp(0, 1)
 
-            # TensorBoard: grid de reconstruções
-            grid = make_grid(comparison, nrow=8, normalize=True, value_range=(0, 1))
-            #board.log_image("Reconstrucao/Teste", grid, epoch)
+                recon_vis = x_recon.clamp(0, 1)
 
-    board.close()
+                comparison = torch.cat(
+                    [sample_vis, recon_vis],
+                    dim=0
+                )
+
+                save_images(
+                    comparison,
+                    os.path.join(
+                        results_dir,
+                        f"{epoch}.png"
+                    )
+                )
+
+    print("\n✅ Treino finalizado")
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
 def main():
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--run_name',     type=str,   default="VQVAE_PONG",  help="Nome do run")
-    parser.add_argument('--epochs',       type=int,   default=400,           help="Total de épocas")
-    parser.add_argument('--batch_size',   type=int,   default=512,            help="Batch size")
-    parser.add_argument('--image_size',   type=int,   default=64,            help="Resolução da imagem")
-    parser.add_argument('--latent_dim',   type=int,   default=128,           help="Dimensão do espaço latente")
-    parser.add_argument('--num_embeddings', type=int, default=512,           help="Tamanho do codebook")
-    parser.add_argument('--lr',           type=float, default=2e-4,          help="Learning rate")
-    parser.add_argument('--device',       type=str,   default="cuda",        help="Device (cuda/cpu)")
-    parser.add_argument('--dataset_path', type=str,   required=True,         help="Caminho para a pasta com os .png")
-    parser.add_argument('--num_workers',  type=int,   default=8,             help="Workers do DataLoader")
+
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default="VQVAE"
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=400
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=128
+    )
+
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=256
+    )
+
+    parser.add_argument(
+        "--num_embeddings",
+        type=int,
+        default=512
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda"
+    )
+
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        required=True
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8
+    )
+
+    parser.add_argument(
+        "--max_files",
+        type=int,
+        default=None
+    )
+
     args = parser.parse_args()
+
     train(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

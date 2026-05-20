@@ -1,174 +1,388 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+
 from vector_quantize_pytorch import VectorQuantize
 
 
-class ResidualBlock(nn.Module):
-    """
-    Bloco residual
+def nonlinearity(x):
+    return x * torch.sigmoid(x)
 
-    Estrutura:
-    - Normalização (GroupNorm) + ativação (SiLU) + convolução 3x3.
-    - Segunda sequência de normalização + ativação + dropout + convolução 3x3.
-    - Conexão residual (skip connection) somando a entrada original à saída,
-      com projeção 1x1 caso o número de canais mude.
-    """
-    def __init__(self, in_channels, out_channels, dropout=0.1):
+
+def Normalize(channels):
+
+    groups = min(32, channels)
+
+    return nn.GroupNorm(
+        num_groups=groups,
+        num_channels=channels,
+        eps=1e-6,
+        affine=True
+    )
+
+
+class ResnetBlock(nn.Module):
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        dropout=0.0
+    ):
         super().__init__()
-        
-        self.norm1 = nn.GroupNorm(8, in_channels)
-        self.act1 = nn.SiLU()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
+        self.norm1 = Normalize(in_channels)
 
-        self.norm2 = nn.GroupNorm(8, out_channels)
-        self.act2 = nn.SiLU()
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            3,
+            padding=1
+        )
+
+        self.norm2 = Normalize(out_channels)
+
         self.dropout = nn.Dropout(dropout)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            3,
+            padding=1
+        )
 
         if in_channels != out_channels:
-            self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
+            self.shortcut = nn.Conv2d(
+                in_channels,
+                out_channels,
+                1
+            )
         else:
             self.shortcut = nn.Identity()
 
     def forward(self, x):
+
         h = self.norm1(x)
-        h = self.act1(h)
+        h = nonlinearity(h)
         h = self.conv1(h)
 
-
         h = self.norm2(h)
-        h = self.act2(h)
+        h = nonlinearity(h)
         h = self.dropout(h)
         h = self.conv2(h)
 
         return h + self.shortcut(x)
-    
-class Downsample(nn.Module):
-    #definindo downsampling com conv strided
+
+
+class AttnBlock(nn.Module):
+
     def __init__(self, channels):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
-    
+
+        self.norm = Normalize(channels)
+
+        self.q = nn.Conv2d(channels, channels, 1)
+        self.k = nn.Conv2d(channels, channels, 1)
+        self.v = nn.Conv2d(channels, channels, 1)
+
+        self.proj_out = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, x):
+
+        h = self.norm(x)
+
+        q = self.q(h)
+        k = self.k(h)
+        v = self.v(h)
+
+        B, C, H, W = q.shape
+
+        q = q.reshape(B, C, H * W)
+        q = q.permute(0, 2, 1)
+
+        k = k.reshape(B, C, H * W)
+
+        attn = torch.bmm(q, k)
+
+        attn = attn * (C ** -0.5)
+
+        attn = torch.softmax(attn, dim=-1)
+
+        v = v.reshape(B, C, H * W)
+
+        attn = attn.permute(0, 2, 1)
+
+        h = torch.bmm(v, attn)
+
+        h = h.reshape(B, C, H, W)
+
+        h = self.proj_out(h)
+
+        return x + h
+
+
+class Downsample(nn.Module):
+
+    def __init__(self, channels):
+        super().__init__()
+
+        self.conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=2,
+            padding=1
+        )
+
     def forward(self, x):
         return self.conv(x)
 
 
 class Upsample(nn.Module):
-    #definindo upsampling com interpolação + conv
+
     def __init__(self, channels):
         super().__init__()
-        self.conv = nn.Conv2d(channels, channels, 3, padding=1)
-    
+
+        self.conv = nn.Conv2d(
+            channels,
+            channels,
+            3,
+            padding=1
+        )
+
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode='nearest')
+
+        x = F.interpolate(
+            x,
+            scale_factor=2,
+            mode="nearest"
+        )
+
         return self.conv(x)
-    
-class Encoder(nn.Module):
-    def __init__(self, channels):
-        self.channels = channels
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels = 3, base_channels=32, latent_dim = 128):
+
+    # 64x64 -> 4x4
+
+    def __init__(
+        self,
+        in_channels=3,
+        base_channels=64,
+        latent_dim=256,
+        dropout=0.0
+    ):
         super().__init__()
-        self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size = 3, padding = 1)
 
-        self.block1 = ResidualBlock(base_channels, base_channels)
-        self.down1 = Downsample(base_channels)
+        ch_mult = [1, 2, 4, 4]
 
-        self.block2 = ResidualBlock(base_channels, base_channels*2)
-        self.down2 = Downsample(base_channels*2)
+        self.conv_in = nn.Conv2d(
+            in_channels,
+            base_channels,
+            3,
+            padding=1
+        )
 
-        self.block3 = ResidualBlock(base_channels*2, base_channels*4)
-        self.down3 = Downsample(base_channels*4)
+        blocks = []
 
-        self.conv_out = nn.Conv2d(base_channels * 4, latent_dim, kernel_size=3, padding=1)
+        curr_res = 64
+        in_ch = base_channels
+
+        for mult in ch_mult:
+
+            out_ch = base_channels * mult
+
+            for _ in range(2):
+
+                blocks.append(
+                    ResnetBlock(
+                        in_ch,
+                        out_ch,
+                        dropout
+                    )
+                )
+
+                in_ch = out_ch
+
+                if curr_res in [16, 8]:
+                    blocks.append(
+                        AttnBlock(in_ch)
+                    )
+
+            if curr_res != 4:
+
+                blocks.append(
+                    Downsample(in_ch)
+                )
+
+                curr_res //= 2
+
+        self.blocks = nn.Sequential(*blocks)
+
+        self.norm_out = Normalize(in_ch)
+
+        self.conv_out = nn.Conv2d(
+            in_ch,
+            latent_dim,
+            3,
+            padding=1
+        )
 
     def forward(self, x):
+
         x = self.conv_in(x)
-        x = self.block1(x)
-        x = self.down1(x)
-        x = self.block2(x)
-        x = self.down2(x)
-        x = self.block3(x)
-        x = self.down3(x)
+
+        x = self.blocks(x)
+
+        x = self.norm_out(x)
+
+        x = nonlinearity(x)
+
         x = self.conv_out(x)
 
         return x
-    
+
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=128, base_channels=32, out_channels=3):
+
+    # 4x4 -> 64x64
+
+    def __init__(
+        self,
+        out_channels=3,
+        base_channels=64,
+        latent_dim=256,
+        dropout=0.0
+    ):
         super().__init__()
-        self.conv_in = nn.Conv2d(latent_dim, base_channels*4, kernel_size = 3, padding = 1)
 
-        self.block1 = ResidualBlock(base_channels*4, base_channels*4)
-        self.up1 = Upsample(base_channels*4)
+        ch_mult = [4, 4, 2, 1]
 
-        self.block2 = ResidualBlock(base_channels*4, base_channels*2)
-        self.up2 = Upsample(base_channels*2)
+        in_ch = base_channels * 4
 
-        self.block3 = ResidualBlock(base_channels*2, base_channels)
-        self.up3 = Upsample(base_channels)
+        self.conv_in = nn.Conv2d(
+            latent_dim,
+            in_ch,
+            3,
+            padding=1
+        )
 
-        self.conv_out = nn.Conv2d(base_channels, out_channels, kernel_size=3, padding=1)
+        blocks = []
+
+        curr_res = 4
+
+        for mult in ch_mult:
+
+            out_ch = base_channels * mult
+
+            for _ in range(2):
+
+                blocks.append(
+                    ResnetBlock(
+                        in_ch,
+                        out_ch,
+                        dropout
+                    )
+                )
+
+                in_ch = out_ch
+
+                if curr_res in [8, 16]:
+                    blocks.append(
+                        AttnBlock(in_ch)
+                    )
+
+            if curr_res != 64:
+
+                blocks.append(
+                    Upsample(in_ch)
+                )
+
+                curr_res *= 2
+
+        self.blocks = nn.Sequential(*blocks)
+
+        self.norm_out = Normalize(in_ch)
+
+        self.conv_out = nn.Conv2d(
+            in_ch,
+            out_channels,
+            3,
+            padding=1
+        )
 
     def forward(self, x):
+
         x = self.conv_in(x)
-        x = self.block1(x)
-        x = self.up1(x)
-        x = self.block2(x)
-        x = self.up2(x)
-        x = self.block3(x)
-        x = self.up3(x)
+
+        x = self.blocks(x)
+
+        x = self.norm_out(x)
+
+        x = nonlinearity(x)
+
         x = self.conv_out(x)
 
-        return torch.sigmoid(x)
-    
+        return x
 
 
 class VQVAE(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=128, num_embeddings=512):
+
+    def __init__(
+        self,
+        in_channels=3,
+        latent_dim=256,
+        num_embeddings=512
+    ):
         super().__init__()
-        self.encoder = Encoder(in_channels, latent_dim=latent_dim)
-        self.vq = VectorQuantize(
-            dim = latent_dim,
-            codebook_size = num_embeddings,
-            decay = 0.8,             
-            commitment_weight = 0.25, 
-            kmeans_init = False,      # <--- A MUDANÇA É APENAS AQUI!
-            use_cosine_sim = True,
-            accept_image_fmap = True 
+
+        self.encoder = Encoder(
+            in_channels=in_channels,
+            base_channels=64,
+            latent_dim=latent_dim
         )
-        self.decoder = Decoder(latent_dim, out_channels=in_channels)
+
+        self.vq = VectorQuantize(
+            dim=latent_dim,
+            codebook_size=num_embeddings,
+            decay=0.99,
+            commitment_weight=0.25,
+            use_cosine_sim=True,
+            accept_image_fmap=True
+        )
+
+        self.decoder = Decoder(
+            out_channels=in_channels,
+            base_channels=64,
+            latent_dim=latent_dim
+        )
+
     def forward(self, x):
-        # 1. Passa pelo Encoder
+
         z = self.encoder(x)
-        
-        # 3. Passa pelo VQ (Nota: a ordem correta de retorno é quantizado, indices, loss)
+
         quantized, indices, vq_loss = self.vq(z)
-        
-        # 5. Reconstrói a imagem
+
         x_recon = self.decoder(quantized)
-        
+
         return x_recon, vq_loss, indices
 
+    @torch.no_grad()
+    def encode_indices(self, x):
+
+        z = self.encoder(x)
+
+        _, indices, _ = self.vq(z)
+
+        return indices
+
+    @torch.no_grad()
     def decode_indices(self, indices):
-        """
-        indices: (B, 64) long  — indices do codebook
-        retorna: (B, 3, 64, 64) float32
-        """
-        batch_size, seq_len = indices.shape
-        grid_size = int(seq_len ** 0.5)  # 8
 
-        # Reshape para (B, H, W) que o get_codes_from_indices espera
-        indices_2d = indices.view(batch_size, grid_size, grid_size)
+        B = indices.shape[0]
 
-        # Busca embeddings — retorna (B, latent_dim, H, W) direto, ja canal-first
-        z_q = self.vq.get_codes_from_indices(indices_2d)  # (B, 128, 8, 8)
+        indices = indices.view(B, 4, 4)
 
-        # Passa pelo decoder
+        z_q = self.vq.get_codes_from_indices(indices)
+
         return self.decoder(z_q)

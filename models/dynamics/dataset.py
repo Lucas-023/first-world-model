@@ -38,7 +38,7 @@ class CarRacingTokenDataset(Dataset):
             actions = d["actions"].astype(np.int64)   # (T,)
             dones   = d["dones"].astype(np.int64)     # (T,)
 
-            # Converte reward continuo para 3 classes — padrao IRIS
+            # Converte reward continuo para 3 classes
             rewards = d["rewards"].astype(np.float32) # (T,) continuo
             rewards_sign = (np.sign(rewards) + 1).astype(np.int64)  # {0,1,2}
 

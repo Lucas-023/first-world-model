@@ -38,6 +38,21 @@ def save_images(images, path):
     save_image(images, path)
 
 
+def evaluate(model, dataloader, recon_loss_fn, device):
+    model.eval()
+    total_loss, n = 0.0, 0
+    with torch.no_grad():
+        for images in dataloader:
+            images = images.to(device)
+            with torch.amp.autocast("cuda"):
+                x_recon, vq_loss, _ = model(images)
+                loss = recon_loss_fn(x_recon, images) + vq_loss
+            total_loss += loss.item()
+            n += 1
+    model.train()
+    return total_loss / max(n, 1)
+
+
 def train(args):
 
     setup_logging(args.run_name)
@@ -59,20 +74,34 @@ def train(args):
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
 
-    ckpt_path = os.path.join(
-        save_dir,
-        "ckpt.pt"
-    )
+    ckpt_path = os.path.join(save_dir, "ckpt.pt")
+    best_path = os.path.join(save_dir, "ckpt_best.pt")
 
     dataset = CarRacingDataset(
         args.dataset_path,
-        max_files=args.max_files
+        split="train",
+        seed=args.seed,
+        max_files=args.max_files,
+    )
+    val_dataset = CarRacingDataset(
+        args.dataset_path,
+        split="val",
+        seed=args.seed,
+        max_files=args.max_files,
     )
 
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
         persistent_workers=args.num_workers > 0
@@ -94,7 +123,8 @@ def train(args):
 
     scaler = torch.amp.GradScaler("cuda")
 
-    start_epoch = 0
+    start_epoch   = 0
+    best_val_loss = float("inf")
 
     if os.path.exists(ckpt_path):
 
@@ -117,10 +147,11 @@ def train(args):
             checkpoint["scaler_state_dict"]
         )
 
-        start_epoch = checkpoint["epoch"] + 1
+        start_epoch   = checkpoint["epoch"] + 1
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
 
         print(
-            f"✅ Retomando da época {start_epoch}"
+            f"✅ Retomando da época {start_epoch} | melhor val: {best_val_loss:.4f}"
         )
 
     for epoch in range(start_epoch, args.epochs):
@@ -172,22 +203,38 @@ def train(args):
 
         avg_loss = sum(losses) / len(losses)
 
+        val_loss = evaluate(model, val_loader, recon_loss_fn, device)
+
         print(
             f"\n📊 Epoch {epoch} "
-            f"| loss={avg_loss:.6f}"
+            f"| train={avg_loss:.4f} "
+            f"| val={val_loss:.4f} "
+            f"| melhor val={best_val_loss:.4f}"
         )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(
+                {
+                    "epoch":                epoch,
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict":    scaler.state_dict(),
+                    "val_loss":             val_loss,
+                },
+                best_path,
+            )
+            print(f"  -> Novo melhor modelo! val={val_loss:.4f}")
 
         checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
+            "epoch":                epoch,
+            "best_val_loss":        best_val_loss,
+            "model_state_dict":     model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "scaler_state_dict": scaler.state_dict()
+            "scaler_state_dict":    scaler.state_dict(),
         }
 
-        torch.save(
-            checkpoint,
-            ckpt_path
-        )
+        torch.save(checkpoint, ckpt_path)
 
         if epoch % 5 == 0:
 
@@ -283,6 +330,12 @@ def main():
         "--max_files",
         type=int,
         default=None
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42
     )
 
     args = parser.parse_args()

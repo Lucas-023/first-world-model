@@ -35,8 +35,8 @@ class DynamicsDataset(Dataset):
         folder:      str,
         split:       str   = "train",
         context_len: int   = 19,
-        train_ratio: float = 0.8,
-        val_ratio:   float = 0.1,
+        train_ratio: float = 0.7,
+        val_ratio:   float = 0.15,
         seed:        int   = 42,
     ):
         assert split in self.SPLITS, f"split deve ser um de {self.SPLITS}"

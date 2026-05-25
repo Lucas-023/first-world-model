@@ -203,7 +203,7 @@ def collect(args, epsilon, n_episodes):
         save_path = os.path.join(args.data_dir, f"episode_{ep_idx:04d}.npz")
         np.savez_compressed(
             save_path,
-            obs     = np.array(obs_buf,    dtype=np.float32),   # (T, 3, 64, 64)
+            obs     = np.array(obs_buf,    dtype=np.float32),   # (T, 3, 84, 84)
             actions = np.array(action_buf, dtype=np.int32),     # (T,)
             rewards = np.array(reward_buf, dtype=np.float32),   # (T,)
             dones   = np.array(done_buf,   dtype=bool),         # (T,)
@@ -273,7 +273,7 @@ def parse_args():
 
     p.add_argument("--frame_skip",  type=int, default=4)
     p.add_argument("--frame_stack", type=int, default=4)
-    p.add_argument("--img_size",    type=int, default=64)
+    p.add_argument("--img_size",    type=int, default=84)
     p.add_argument("--crop_rows",   type=int, default=12)
     p.add_argument("--seed",        type=int, default=0)
 

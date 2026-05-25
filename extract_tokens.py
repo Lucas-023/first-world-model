@@ -2,13 +2,13 @@
 Extrai tokens VQ-VAE de cada episodio.
 
 Saida por episodio (dataset_tokens/episode_XXXX.npz):
-    tokens  : (T, 16)  uint16  — indices do codebook por frame (grid 4x4)
-    actions : (T,)     int32   — acoes discretas (0-4)
-    rewards : (T,)     float32 — rewards continuos BRUTOS (sem discretizar)
-    dones   : (T,)     uint8   — 0 ou 1
+    tokens  : (T, 64) uint16  — indices do codebook por frame (grid 8x8)
+    actions : (T,)    int32   — acoes discretas (0-4)
+    rewards : (T,)    float32 — rewards continuos BRUTOS (sem discretizar)
+    dones   : (T,)    uint8   — 0 ou 1
 
-A conversao de reward para 3 classes {-1,0,+1} e feita no dataset.py,
-nao aqui — assim este arquivo fica agnóstico sobre como o reward sera usado.
+A conversao de reward para 3 classes {-1,0,+1} e feita no dataset,
+nao aqui — assim este arquivo fica agnostico sobre como o reward sera usado.
 """
 
 import os
@@ -31,7 +31,7 @@ def extract_tokens(
     print(f"Carregando VQ-VAE de: {vqvae_ckpt}")
     vqvae = VQVAE(
         in_channels=3,
-        latent_dim=256,        # novo VQ-VAE 4x4
+        latent_dim=256,
         num_embeddings=vocab_size,
     ).to(device)
 
@@ -47,7 +47,7 @@ def extract_tokens(
     with torch.no_grad():
         for f in tqdm(files):
             data    = np.load(os.path.join(dataset_in, f))
-            obs     = data["obs"]       # (T, 3, 64, 64) float32
+            obs     = data["obs"]       # (T, 3, H, W) float32
             actions = data["actions"]   # (T,)
             rewards = data["rewards"]   # (T,) float32 continuo
             dones   = data["dones"]     # (T,)
@@ -64,12 +64,12 @@ def extract_tokens(
             obs_tensor = torch.from_numpy(obs).float().to(device)
             _, _, indices = vqvae(obs_tensor)
 
-            # indices: (T, 4, 4) -> (T, 16)
+            # indices: (T, 8, 8) -> (T, 64)
             tokens = indices.view(obs_tensor.size(0), -1).cpu().numpy().astype(np.uint16)
 
             np.savez_compressed(
                 os.path.join(dataset_out, f),
-                tokens  = tokens,                       # (T, 16) uint16
+                tokens  = tokens,                       # (T, 64) uint16
                 actions = actions.astype(np.int32),     # (T,)
                 rewards = rewards.astype(np.float32),   # (T,) continuo bruto
                 dones   = dones.astype(np.uint8),       # (T,)

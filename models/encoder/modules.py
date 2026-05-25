@@ -163,7 +163,7 @@ class Upsample(nn.Module):
 
 class Encoder(nn.Module):
 
-    # 64x64 -> 4x4
+    # 64x64 -> 8x8
 
     def __init__(
         self,
@@ -209,7 +209,7 @@ class Encoder(nn.Module):
                         AttnBlock(in_ch)
                     )
 
-            if curr_res != 4:
+            if curr_res != 8:
 
                 blocks.append(
                     Downsample(in_ch)
@@ -245,7 +245,7 @@ class Encoder(nn.Module):
 
 class Decoder(nn.Module):
 
-    # 4x4 -> 64x64
+    # 8x8 -> 64x64
 
     def __init__(
         self,
@@ -269,7 +269,7 @@ class Decoder(nn.Module):
 
         blocks = []
 
-        curr_res = 4
+        curr_res = 8
 
         for mult in ch_mult:
 
@@ -359,16 +359,26 @@ class VQVAE(nn.Module):
 
     def forward(self, x):
 
+        orig_size = x.shape[-2:]
+        if tuple(orig_size) != (64, 64):
+            x = F.interpolate(x, (64, 64), mode='bilinear', align_corners=False)
+
         z = self.encoder(x)
 
         quantized, indices, vq_loss = self.vq(z)
 
         x_recon = self.decoder(quantized)
 
+        if tuple(orig_size) != (64, 64):
+            x_recon = F.interpolate(x_recon, orig_size, mode='bilinear', align_corners=False)
+
         return x_recon, vq_loss, indices
 
     @torch.no_grad()
     def encode_indices(self, x):
+
+        if tuple(x.shape[-2:]) != (64, 64):
+            x = F.interpolate(x, (64, 64), mode='bilinear', align_corners=False)
 
         z = self.encoder(x)
 
@@ -381,7 +391,7 @@ class VQVAE(nn.Module):
 
         B = indices.shape[0]
 
-        indices = indices.view(B, 4, 4)
+        indices = indices.view(B, 8, 8)
 
         z_q = self.vq.get_codes_from_indices(indices)
 

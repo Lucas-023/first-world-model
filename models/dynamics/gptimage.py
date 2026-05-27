@@ -36,8 +36,9 @@ class DynamicsConfig:
         self.act_vocab_size   = act_vocab_size
         self.img_tokens       = img_tokens
         self.context_len      = context_len
-        self.tokens_per_block = img_tokens + 1                  # 65
-        self.block_size       = self.tokens_per_block * context_len  # 65*19=1235
+        self.tokens_per_block = img_tokens + 1                       # 65
+        # +1 para acomodar o bloco target em compute_loss e imagine_next_frame
+        self.block_size       = self.tokens_per_block * (context_len + 1)  # 65*20=1300
         self.n_embd   = n_embd
         self.n_head   = n_head
         self.n_layer  = n_layer
@@ -189,24 +190,24 @@ class DynamicsModel(nn.Module):
         ], lr=learning_rate, betas=betas)
 
     @torch.no_grad()
-    def imagine_next_frame(self, obs_tokens, act_token, temperature=1.0, top_k=50):
+    def imagine_next_frame(self, obs_tokens, act_tokens, act_token, temperature=1.0, top_k=50):
         """
         Dado historico de context_len frames, imagina o proximo frame
         autorregressivamente token por token.
 
-        obs_tokens : (1, context_len, 64)
-        act_token  : (1,)  — acao a tomar no proximo passo
+        obs_tokens : (B, context_len, 64)
+        act_tokens : (B, context_len)  — acoes do contexto
+        act_token  : (B,)              — acao a tomar no proximo passo
 
-        Retorna: (1, 64)
+        Retorna: (B, 64)
         """
         B, T, K = obs_tokens.shape
         device   = obs_tokens.device
 
         # Placeholder para o frame a imaginar
         next_frame = torch.zeros(B, 1, K, dtype=torch.long, device=device)
-        ctx_obs    = torch.cat([obs_tokens, next_frame], dim=1)    # (B, T+1, 64)
-        ctx_act    = torch.zeros(B, T + 1, dtype=torch.long, device=device)
-        ctx_act[:, -1] = act_token
+        ctx_obs    = torch.cat([obs_tokens, next_frame], dim=1)              # (B, T+1, 64)
+        ctx_act    = torch.cat([act_tokens, act_token.unsqueeze(1)], dim=1)  # (B, T+1)
 
         # Gera os 64 tokens um por um (autorregressivo dentro do bloco)
         for k in range(K):

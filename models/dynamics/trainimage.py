@@ -43,7 +43,7 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20):
 
         for i in range(n_frames):
             next_act = act_ctx[0:1, min(i, act_ctx.shape[1]-1)]
-            next_obs = model.imagine_next_frame(ctx_obs, next_act)
+            next_obs = model.imagine_next_frame(ctx_obs, ctx_act, next_act)
 
             frames.append(next_obs)
             # Desliza a janela: remove o frame mais antigo, adiciona o novo
@@ -94,9 +94,10 @@ def train(args):
                               shuffle=False, num_workers=0, pin_memory=True)
 
     # -- Modelo ---------------------------------------------------------------
+    device_type = device.split(":")[0]   # "cuda" ou "cpu"
     model     = DynamicsModel(config).to(device)
     optimizer = model.configure_optimizers(weight_decay=0.01, learning_rate=args.lr)
-    scaler    = GradScaler()
+    scaler    = GradScaler(device_type)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parametros: {n_params:,}")
@@ -166,7 +167,7 @@ def train(args):
             last_batch = (obs_ctx, act_ctx)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(device_type="cuda"):
+            with autocast(device_type=device_type):
                 loss = model.compute_loss(obs_ctx, act_ctx, obs_target)
 
             scaler.scale(loss).backward()

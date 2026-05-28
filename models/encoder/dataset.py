@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+
 from torch.utils.data import Dataset
 
 
@@ -17,12 +18,16 @@ class CarRacingDataset(Dataset):
         seed:        int   = 42,
         max_files:   int   = None,
     ):
-        assert split in self.SPLITS, f"split deve ser um de {self.SPLITS}"
+
+        assert split in self.SPLITS
         assert train_ratio + val_ratio < 1.0
 
-        files = sorted([f for f in os.listdir(folder_path) if f.endswith(".npz")])
+        files = sorted([
+            f for f in os.listdir(folder_path)
+            if f.endswith(".npz")
+        ])
 
-        rng   = np.random.default_rng(seed)
+        rng = np.random.default_rng(seed)
         files = [files[i] for i in rng.permutation(len(files))]
 
         if max_files is not None:
@@ -35,29 +40,52 @@ class CarRacingDataset(Dataset):
         if split == "train":
             selected = files[:n_train]
         elif split == "val":
-            selected = files[n_train : n_train + n_val]
+            selected = files[n_train:n_train+n_val]
         else:
-            selected = files[n_train + n_val:]
+            selected = files[n_train+n_val:]
+
+        self.folder_path = folder_path
+        self.index_map   = []
 
         print(f"[{split:>5}] {len(selected)}/{n} episodios")
-        print(f"⏳ Carregando {len(selected)} arquivos para RAM...")
 
-        all_frames = []
+        # --------------------------------------------------
+        # Cria mapeamento global:
+        #
+        # idx global -> (arquivo, frame_idx)
+        # --------------------------------------------------
 
-        for f in selected:
-            path = os.path.join(folder_path, f)
-            data = np.load(path)["obs"]  # (T, 3, H, W)
-            data = data.astype(np.float32)
-            if data.max() > 1.0:
-                data = data / 255.0
-            all_frames.append(data)
+        for fname in selected:
 
-        self.data = np.concatenate(all_frames, axis=0)
-        mb = self.data.nbytes / (1024 ** 2)
-        print(f"✅ {len(self.data)} frames carregados ({mb:.1f} MB)")
+            path = os.path.join(folder_path, fname)
+
+            # mmap_mode evita carregar tudo
+            data = np.load(path, mmap_mode="r")
+
+            T = data["obs"].shape[0]
+
+            for frame_idx in range(T):
+                self.index_map.append(
+                    (path, frame_idx)
+                )
+
+        print(f"✅ {len(self.index_map)} frames indexados")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.index_map)
 
     def __getitem__(self, idx):
-        return torch.from_numpy(self.data[idx]).float()
+
+        path, frame_idx = self.index_map[idx]
+
+        # carrega somente UM frame
+        data = np.load(path, mmap_mode="r")
+
+        frame = data["obs"][frame_idx]
+
+        frame = frame.astype(np.float32)
+
+        if frame.max() > 1.0:
+            frame = frame / 255.0
+
+        return torch.from_numpy(frame).float()

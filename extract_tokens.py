@@ -82,5 +82,5 @@ if __name__ == "__main__":
     extract_tokens(
         dataset_in  = "dataset",
         dataset_out = "dataset_tokens",
-        vqvae_ckpt  = "models/VQVAE/ckpt.pt",
+        vqvae_ckpt  = "models/VQVAE/ckpt_best.pt",
     )

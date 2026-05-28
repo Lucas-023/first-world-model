@@ -264,8 +264,8 @@ def parse_args():
 
     p.add_argument("--model_path",  type=str, required=True,
                    help="Caminho para o modelo PPO (.zip)")
-    p.add_argument("--n_episodes",  type=int, default=500,
-                   help="Numero de episodios a coletar (default: 500)")
+    p.add_argument("--n_episodes",  type=int, default=2000,
+                   help="Numero de episodios a coletar (default: 2000)")
     p.add_argument("--data_dir",    type=str, default="./dataset",
                    help="Pasta onde salvar os episodios (default: ./dataset)")
     p.add_argument("--epsilon",     type=float, default=0.02,

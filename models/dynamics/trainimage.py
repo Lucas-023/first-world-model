@@ -17,8 +17,8 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image, make_grid
 
-from gptimage   import DynamicsModel, DynamicsConfig
-from datasetimage import DynamicsDataset
+from models.dynamics.gptimage   import DynamicsModel, DynamicsConfig
+from models.dynamics.datasetimage import DynamicsDataset
 
 
 def evaluate(model, dataloader, device):

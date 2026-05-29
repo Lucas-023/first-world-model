@@ -66,10 +66,22 @@ def load_vqvae(ckpt_path, vocab_size, device):
     return vqvae
 
 
-def pick_episode(dataset_path, episode_idx, context_len, n_dream, rng):
+def get_test_files(dataset_path, train_ratio=0.70, val_ratio=0.15, seed=42):
+    """Replica o mesmo split do DynamicsDataset para garantir que a inferencia
+    use apenas episodios do conjunto de teste."""
     files = sorted(glob.glob(os.path.join(dataset_path, "*.npz")))
+    rng   = np.random.default_rng(seed)
+    files = [files[i] for i in rng.permutation(len(files))]
+    n       = len(files)
+    n_train = int(n * train_ratio)
+    n_val   = int(n * val_ratio)
+    return files[n_train + n_val:]
+
+
+def pick_episode(dataset_path, episode_idx, context_len, n_dream, rng):
+    files = get_test_files(dataset_path)
     if not files:
-        raise FileNotFoundError(f"Nenhum .npz em {dataset_path}")
+        raise FileNotFoundError(f"Nenhum .npz no split de teste em {dataset_path}")
 
     if episode_idx is None:
         # Tenta achar um episodio longo o suficiente
@@ -87,7 +99,7 @@ def pick_episode(dataset_path, episode_idx, context_len, n_dream, rng):
 
     path = files[episode_idx]
     d    = np.load(path, allow_pickle=False)
-    print(f"Episodio: {os.path.basename(path)}  ({d['tokens'].shape[0]} frames)")
+    print(f"Episodio (test split): {os.path.basename(path)}  ({d['tokens'].shape[0]} frames)")
     return d, path
 
 

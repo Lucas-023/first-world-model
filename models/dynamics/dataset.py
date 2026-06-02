@@ -1,18 +1,12 @@
 """
-CarRacingTokenDataset
-=====================
-Carrega episodios tokenizados e devolve janelas de tamanho seq_len
-para treinar o World Model.
+Dataset para Dynamics GPT com contexto -> proximo passo.
 
-Cada item devolvido:
-    obs_tokens   : (seq_len, 16)  long  — indices visuais [0, obs_vocab)
-    act_tokens   : (seq_len,)     long  — acoes [0, 4]
-    rewards_sign : (seq_len,)     long  — {0=negativo, 1=neutro, 2=positivo}
-    dones        : (seq_len,)     long  — {0, 1}
-
-A conversao de reward continuo para 3 classes e feita aqui via sign(),
-identica ao IRIS original:
-    rewards.sign() + 1  →  -1→0, 0→1, qualquer positivo→2
+Cada janela devolve:
+    obs_ctx      : (context_len, 64)
+    act_ctx      : (context_len,)
+    obs_target   : (64,)
+    reward_class : ()  em {0,1,2} = {neg, neutro, pos}
+    done_target  : ()  em {0,1}
 """
 
 import os
@@ -23,48 +17,74 @@ from torch.utils.data import Dataset
 
 
 class CarRacingTokenDataset(Dataset):
+    SPLITS = ("train", "val", "test")
 
-    def __init__(self, folder: str, seq_len: int = 20):
-        self.seq_len = seq_len
-        self.chunks  = []
+    def __init__(
+        self,
+        folder: str,
+        split: str = "train",
+        context_len: int = 19,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        seed: int = 42,
+    ):
+        assert split in self.SPLITS, f"split deve ser um de {self.SPLITS}"
+        assert train_ratio + val_ratio < 1.0
+
+        self.context_len = context_len
+        self.chunks = []
 
         files = sorted(glob.glob(os.path.join(folder, "*.npz")))
-        print(f"Carregando {len(files)} episodios de tokens...")
+        rng = np.random.default_rng(seed)
+        files = [files[i] for i in rng.permutation(len(files))]
 
-        for f in files:
+        n = len(files)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+
+        if split == "train":
+            selected = files[:n_train]
+        elif split == "val":
+            selected = files[n_train:n_train + n_val]
+        else:
+            selected = files[n_train + n_val:]
+
+        print(f"[{split:>5}] {len(selected)}/{n} episodios")
+
+        for f in selected:
             d = np.load(f, allow_pickle=False)
-
-            tokens  = d["tokens"].astype(np.int64)    # (T, 16)
-            actions = d["actions"].astype(np.int64)   # (T,)
-            dones   = d["dones"].astype(np.int64)     # (T,)
-
-            # Converte reward continuo para 3 classes
-            rewards = d["rewards"].astype(np.float32) # (T,) continuo
+            tokens = d["tokens"].astype(np.int64)        # (T, 64)
+            actions = d["actions"].astype(np.int64)      # (T,)
+            dones = d["dones"].astype(np.int64)          # (T,)
+            rewards = d["rewards"].astype(np.float32)    # (T,)
             rewards_sign = (np.sign(rewards) + 1).astype(np.int64)  # {0,1,2}
 
             T = tokens.shape[0]
-            if T < seq_len:
+            if T < context_len + 1:
                 continue
 
-            for start in range(0, T - seq_len + 1, seq_len):
-                end = start + seq_len
-                self.chunks.append((
-                    tokens      [start:end],   # (seq_len, 16)
-                    actions     [start:end],   # (seq_len,)
-                    rewards_sign[start:end],   # (seq_len,)
-                    dones       [start:end],   # (seq_len,)
-                ))
+            for i in range(T - context_len):
+                obs_ctx = tokens[i:i + context_len]                   # (context_len, 64)
+                act_ctx = actions[i:i + context_len]                  # (context_len,)
+                obs_target = tokens[i + context_len]                  # (64,)
+                reward_target = rewards_sign[i + context_len]         # ()
+                done_target = dones[i + context_len]                  # ()
+                self.chunks.append((obs_ctx, act_ctx, obs_target, reward_target, done_target))
 
-        print(f"Total de sequencias: {len(self.chunks)}")
+        print(f"[{split:>5}] {len(self.chunks)} janelas (contexto={context_len})")
 
     def __len__(self):
         return len(self.chunks)
 
     def __getitem__(self, idx):
-        tok, act, rew, don = self.chunks[idx]
+        obs_ctx, act_ctx, obs_target, reward_target, done_target = self.chunks[idx]
         return (
-            torch.from_numpy(tok).long(),
-            torch.from_numpy(act).long(),
-            torch.from_numpy(rew).long(),
-            torch.from_numpy(don).long(),
+            torch.from_numpy(obs_ctx).long(),
+            torch.from_numpy(act_ctx).long(),
+            torch.from_numpy(obs_target).long(),
+            torch.tensor(reward_target, dtype=torch.long),
+            torch.tensor(done_target, dtype=torch.long),
         )
+
+
+DynamicsDataset = CarRacingTokenDataset

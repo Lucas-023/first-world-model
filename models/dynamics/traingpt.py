@@ -1,126 +1,117 @@
 """
-
-Uso:
-    python -m models.dynamics.traingpt --dataset_path dataset_tokens
-    python -m models.dynamics.traingpt --dataset_path dataset_tokens --overfit_test
+Treino do Dynamics GPT (imagem + reward + done).
 """
 
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import torch
 import argparse
-import numpy as np
+import torch
 from tqdm import tqdm
 from torch.amp import autocast, GradScaler
-from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import make_grid
+from torch.utils.data import DataLoader
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
-from models.encoder.utils import setup_logging
-from models.encoder.board import Board
 from models.dynamics.dataset import CarRacingTokenDataset
 
 
+def evaluate(model, dataloader, device):
+    model.eval()
+    tot = {"loss": 0.0, "obs": 0.0, "rew": 0.0, "done": 0.0}
+    n = 0
+    with torch.no_grad():
+        for obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt in dataloader:
+            obs_ctx = obs_ctx.to(device)
+            act_ctx = act_ctx.to(device)
+            obs_tgt = obs_tgt.to(device)
+            rew_tgt = rew_tgt.to(device)
+            done_tgt = done_tgt.to(device)
+            loss, l_obs, l_rew, l_done = model.compute_loss(obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt)
+            tot["loss"] += loss.item()
+            tot["obs"] += l_obs.item()
+            tot["rew"] += l_rew.item()
+            tot["done"] += l_done.item()
+            n += 1
+    if n == 0:
+        return {k: 0.0 for k in tot}
+    return {k: v / n for k, v in tot.items()}
 
 
 def train_gpt(args):
-    setup_logging(args.run_name)
+    os.makedirs(args.save_dir, exist_ok=True)
+    ckpt_path = os.path.join(args.save_dir, "gpt_ckpt.pt")
+    best_path = os.path.join(args.save_dir, "gpt_best.pt")
     device = args.device
-    torch.backends.cudnn.benchmark = True
+    device_type = device.split(":")[0]
 
-    save_dir  = os.path.join("models", args.run_name)
-    os.makedirs(save_dir, exist_ok=True)
-    ckpt_path = os.path.join(save_dir, "gpt_ckpt.pt")
-
-    board = Board(args.run_name)
-
-    # Config
     config = WorldModelConfig(
-        obs_vocab_size = args.vocab_size,
-        act_vocab_size = 5,
-        img_tokens     = 16,
-        frames_per_seq = args.frames_per_seq,
-        n_embd         = args.n_embd,
-        n_head         = args.n_head,
-        n_layer        = args.n_layer,
-        dropout        = args.dropout,
+        obs_vocab_size=args.vocab_size,
+        act_vocab_size=5,
+        img_tokens=64,
+        context_len=args.context_len,
+        n_embd=args.n_embd,
+        n_head=args.n_head,
+        n_layer=args.n_layer,
+        dropout=args.dropout,
     )
-    print(f"Tokens por bloco  : {config.tokens_per_block}")
-    print(f"Block size        : {config.block_size}")
-    print(f"Heads             : obs({config.obs_vocab_size}) | reward(3) | done(2)")
+    print(f"Contexto         : {config.context_len} frames")
+    print(f"Tokens por bloco : {config.tokens_per_block}")
+    print(f"Block size       : {config.block_size}")
 
-    # Dataset
-    dataset    = CarRacingTokenDataset(args.dataset_path, seq_len=args.frames_per_seq)
-    dataloader = DataLoader(
-        dataset,
-        batch_size  = args.batch_size,
-        shuffle     = True,
-        num_workers = 0,
-        pin_memory  = True,
-    )
+    train_ds = CarRacingTokenDataset(args.dataset_path, split="train", context_len=args.context_len, seed=args.seed)
+    val_ds = CarRacingTokenDataset(args.dataset_path, split="val", context_len=args.context_len, seed=args.seed)
+    test_ds = CarRacingTokenDataset(args.dataset_path, split="test", context_len=args.context_len, seed=args.seed)
 
-    # Modelo
-    model     = WorldModel(config).to(device)
-    optimizer = model.configure_optimizers(
-        weight_decay=0.1, learning_rate=args.lr, betas=(0.9, 0.95)
-    )
-    scaler = GradScaler()
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parametros treinaveis: {n_params:,}")
+    model = WorldModel(config).to(device)
+    optimizer = model.configure_optimizers(weight_decay=0.01, learning_rate=args.lr)
+    scaler = GradScaler(device_type)
 
-    # Checkpoint
     start_epoch = 0
     global_step = 0
+    best_val = float("inf")
     if os.path.exists(ckpt_path):
         print(f"Retomando de: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
-        global_step = ckpt.get("global_step", start_epoch * len(dataloader))
+        global_step = ckpt.get("global_step", 0)
+        best_val = ckpt.get("best_val_loss", float("inf"))
         print(f"Continuando da epoca {start_epoch}")
-    else:
-        print("Iniciando do zero.")
 
-    # Overfit test
     if args.overfit_test:
-        print("\nModo OVERFIT em 1 batch (sanity check)...")
         model.train()
-        obs_tok, act_tok, rew_sign, dones = [b.to(device) for b in next(iter(dataloader))]
-
+        obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt = [b.to(device) for b in next(iter(train_loader))]
         for step in range(3000):
-            loss, l_obs, l_rew, l_end = model.compute_loss(obs_tok, act_tok, rew_sign, dones)
+            loss, l_obs, l_rew, l_done = model.compute_loss(obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             if step % 500 == 0:
-                print(f"  step {step:>4} | loss {loss.item():.4f} "
-                      f"(obs {l_obs.item():.4f} | rew {l_rew.item():.4f} | end {l_end.item():.4f})")
-
-        print("Overfit test concluido.")
+                print(
+                    f"step {step:>4} | total {loss.item():.4f} | "
+                    f"obs {l_obs.item():.4f} | rew {l_rew.item():.4f} | done {l_done.item():.4f}"
+                )
         return
 
-    # Loop principal
-    print(f"\nIniciando treino...")
+    print("\nIniciando treino...")
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        pbar          = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}")
-        last_obs_tok  = None
-        last_act_tok  = None
-
-        for batch in pbar:
-            obs_tok, act_tok, rew_sign, dones = [b.to(device) for b in batch]
-            last_obs_tok = obs_tok
-            last_act_tok = act_tok
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
+        for obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt in pbar:
+            obs_ctx = obs_ctx.to(device)
+            act_ctx = act_ctx.to(device)
+            obs_tgt = obs_tgt.to(device)
+            rew_tgt = rew_tgt.to(device)
+            done_tgt = done_tgt.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast(device_type="cuda"):
-                loss, l_obs, l_rew, l_end = model.compute_loss(
-                    obs_tok, act_tok, rew_sign, dones
-                )
+            with autocast(device_type=device_type):
+                loss, l_obs, l_rew, l_done = model.compute_loss(obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -129,94 +120,70 @@ def train_gpt(args):
             scaler.update()
 
             pbar.set_postfix(
-                Loss=f"{loss.item():.4f}",
-                Obs=f"{l_obs.item():.4f}",
-                Rew=f"{l_rew.item():.4f}",
+                total=f"{loss.item():.4f}",
+                obs=f"{l_obs.item():.4f}",
+                rew=f"{l_rew.item():.4f}",
+                done=f"{l_done.item():.4f}",
             )
-            board.log_scalar("Loss/Total",   loss.item(),  global_step)
-            board.log_scalar("Loss/Obs",     l_obs.item(), global_step)
-            board.log_scalar("Loss/Reward",  l_rew.item(), global_step)
-            board.log_scalar("Loss/Done",    l_end.item(), global_step)
             global_step += 1
 
-        # Visualizacao
-        model.eval()
-        if (epoch % 5 == 0 or epoch == start_epoch) and last_obs_tok is not None:
-            try:
-                from models.encoder.modules import VQVAE
-                vqvae_path = "models/VQVAE/ckpt.pt"
-                if os.path.exists(vqvae_path):
-                    vqvae = VQVAE(
-                        in_channels=3, latent_dim=128,
-                        num_embeddings=args.vocab_size
-                    ).to(device)
-                    vqvae_ckpt = torch.load(vqvae_path, map_location=device, weights_only=True)
-                    vqvae.load_state_dict(vqvae_ckpt["model_state_dict"])
-                    vqvae.eval()
+        val_metrics = evaluate(model, val_loader, device)
+        print(
+            f"[Epoch {epoch:>5}] val total {val_metrics['loss']:.4f} | "
+            f"obs {val_metrics['obs']:.4f} | rew {val_metrics['rew']:.4f} | done {val_metrics['done']:.4f}"
+        )
 
-                    with torch.no_grad():
-                        # Usa primeiro sample do batch como contexto
-                        seed_obs = last_obs_tok[0:1, :10, :]  # (1, 10, 64)
-                        seed_act = last_act_tok[0:1, :10]     # (1, 10)
+        if val_metrics["loss"] < best_val:
+            best_val = val_metrics["loss"]
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "val_loss": best_val,
+                    "config": config.__dict__,
+                },
+                best_path,
+            )
+            print(f"  -> Novo melhor modelo ({best_val:.4f})")
 
-                        dream_frames = []
-                        ctx_obs = seed_obs
-                        ctx_act = seed_act
+        torch.save(
+            {
+                "epoch": epoch,
+                "global_step": global_step,
+                "best_val_loss": best_val,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+            ckpt_path,
+        )
 
-                        # Imagina 20 frames autorregressivamente
-                        for _ in range(20):
-                            # Usa acao 0 para imaginar
-                            next_act = torch.zeros(1, dtype=torch.long, device=device)
-                            next_obs, _, done = model.imagine_next_frame(
-                                ctx_obs, next_act, temperature=1.0, top_k=50
-                            )
-                            dream_frames.append(next_obs)
-                            ctx_obs = torch.cat([ctx_obs, next_obs.unsqueeze(1)], dim=1)
-                            ctx_act = torch.cat([ctx_act, next_act.unsqueeze(0).unsqueeze(0)], dim=1)
-                            if done.item():
-                                break
-
-                        if dream_frames:
-                            all_tokens = torch.cat(dream_frames, dim=0)  # (N, 64)
-                            decoded    = vqvae.decode_indices(all_tokens)  # (N, 3, 64, 64)
-                            grid = make_grid(decoded.cpu(), nrow=10, normalize=True, value_range=(0, 1))
-                            board.log_image("Imagination/Dream", grid, epoch)
-                            print(f"[Epoch {epoch}] {len(dream_frames)} frames imaginados gerados.")
-
-                    del vqvae
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Aviso: falha na visualizacao: {e}")
-
-        board.log_layer_gradients(model, epoch)
-
-        torch.save({
-            "epoch":                epoch,
-            "global_step":          global_step,
-            "model_state_dict":     model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        }, ckpt_path)
-
-    board.close()
+    print("\nAvaliacao no test set...")
+    if os.path.exists(best_path):
+        best = torch.load(best_path, map_location=device, weights_only=True)
+        model.load_state_dict(best["model_state_dict"])
+    test_metrics = evaluate(model, test_loader, device)
+    print(
+        f"Test total {test_metrics['loss']:.4f} | obs {test_metrics['obs']:.4f} | "
+        f"rew {test_metrics['rew']:.4f} | done {test_metrics['done']:.4f}"
+    )
     print("Treino finalizado!")
-
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--run_name",       type=str,   default="GPT_CARRACING")
-    p.add_argument("--dataset_path",   type=str,   required=True)
-    p.add_argument("--epochs",         type=int,   default=15000)
-    p.add_argument("--batch_size",     type=int,   default=32)
-    p.add_argument("--vocab_size",     type=int,   default=512)
-    p.add_argument("--frames_per_seq", type=int,   default=20)
-    p.add_argument("--n_embd",         type=int,   default=512)
-    p.add_argument("--n_head",         type=int,   default=8)
-    p.add_argument("--n_layer",        type=int,   default=8)
-    p.add_argument("--dropout",        type=float, default=0.1)
-    p.add_argument("--lr",             type=float, default=1e-4)
-    p.add_argument("--overfit_test",   action="store_true")
-    p.add_argument("--device",         type=str,
-                   default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--dataset_path", type=str, required=True)
+    p.add_argument("--save_dir", type=str, default="models/dynamics")
+    p.add_argument("--epochs", type=int, default=5000)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--vocab_size", type=int, default=512)
+    p.add_argument("--context_len", type=int, default=19)
+    p.add_argument("--n_embd", type=int, default=256)
+    p.add_argument("--n_head", type=int, default=4)
+    p.add_argument("--n_layer", type=int, default=6)
+    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--overfit_test", action="store_true")
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
     train_gpt(args)

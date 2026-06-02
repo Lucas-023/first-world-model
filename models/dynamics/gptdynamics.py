@@ -1,16 +1,8 @@
 """
-World Model estilo IRIS com heads separadas.
-
-Layout por bloco (tokens_per_block = 17):
-    [z_0, z_1, ..., z_63, a]   — 16 tokens visuais + 1 token de acao
-
-Heads:
-    head_obs     — prediz tokens visuais (obs_vocab_size classes)
-    head_rewards — prediz reward com 3 classes {-1, 0, +1}
-    head_ends    — prediz done  com 2 classes {0, 1}
-
-Reward e done sao inferidos da representacao interna na posicao
-da acao — nao sao tokens explicitos na sequencia (padrao IRIS).
+Dynamics GPT para prever:
+1) tokens da proxima imagem
+2) classe de reward {-1, 0, +1}
+3) done {0, 1}
 """
 
 import torch
@@ -18,304 +10,156 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-
-class LayerNorm(nn.Module):
-    def __init__(self, ndim, bias=True):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias   = nn.Parameter(torch.zeros(ndim)) if bias else None
-
-    def forward(self, x):
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn  = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj  = nn.Linear(config.n_embd, config.n_embd,     bias=config.bias)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head  = config.n_head
-        self.n_embd  = config.n_embd
-        self.dropout = config.dropout
-
-    def forward(self, x):
-        B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None,
-            dropout_p=self.dropout if self.training else 0,
-            is_causal=True,
-        )
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_dropout(self.c_proj(y))
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
-            nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
-            nn.Dropout(config.dropout),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, config.bias)
-        self.mlp  = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
-
-# Config
-
 class WorldModelConfig:
-    """
-    tokens_per_block = img_tokens + 1  (16 visuais + 1 acao = 17)
-
-    Layout por bloco:
-        [z_0 .. z_63 | a]
-
-    Reward e done NAO sao tokens — sao preditos pelas heads
-    a partir da representacao na posicao da acao.
-    """
     def __init__(
         self,
-        obs_vocab_size: int   = 512,
-        act_vocab_size: int   = 5,
-        img_tokens:     int   = 1,
-        frames_per_seq: int   = 20,
-        n_embd:         int   = 512,
-        n_head:         int   = 8,
-        n_layer:        int   = 8,
-        dropout:        float = 0.1,
-        bias:           bool  = True,
+        obs_vocab_size: int = 512,
+        act_vocab_size: int = 5,
+        img_tokens: int = 64,
+        context_len: int = 19,
+        n_embd: int = 256,
+        n_head: int = 4,
+        n_layer: int = 6,
+        dropout: float = 0.1,
     ):
-        self.obs_vocab_size   = obs_vocab_size
-        self.act_vocab_size   = act_vocab_size
-        self.reward_vocab     = 3   # {-1, 0, +1}
-        self.done_vocab       = 2   # {0, 1}
+        self.obs_vocab_size = obs_vocab_size
+        self.act_vocab_size = act_vocab_size
+        self.reward_vocab = 3
+        self.done_vocab = 2
+        self.img_tokens = img_tokens
+        self.context_len = context_len
+        self.tokens_per_block = img_tokens + 1
+        self.block_size = self.tokens_per_block * (context_len + 1)
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_layer = n_layer
+        self.dropout = dropout
 
-        self.img_tokens       = img_tokens
-        self.tokens_per_block = img_tokens + 1              
-        self.frames_per_seq   = frames_per_seq
-        self.block_size       = self.tokens_per_block * frames_per_seq  
-
-        self.n_embd   = n_embd
-        self.n_head   = n_head
-        self.n_layer  = n_layer
-        self.dropout  = dropout
-        self.bias     = bias
-
-
-# World Model
 
 class WorldModel(nn.Module):
     def __init__(self, config: WorldModelConfig):
         super().__init__()
         self.config = config
 
-        # Embeddings separados por tipo, o modelo aprende representacoes distintas para tokens visuais e tokens de acao
         self.obs_emb = nn.Embedding(config.obs_vocab_size, config.n_embd)
         self.act_emb = nn.Embedding(config.act_vocab_size, config.n_embd)
-        self.pos_emb = nn.Embedding(config.block_size,     config.n_embd)
-        self.drop    = nn.Dropout(config.dropout)
+        self.pos_emb = nn.Embedding(config.block_size, config.n_embd)
+        self.drop = nn.Dropout(config.dropout)
 
-        # Transformer
-        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-        self.ln_f   = LayerNorm(config.n_embd, config.bias)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.n_embd,
+            nhead=config.n_head,
+            dim_feedforward=4 * config.n_embd,
+            dropout=config.dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=config.n_layer)
 
-        # Head de observacao: prediz proximo token visual
         self.head_obs = nn.Linear(config.n_embd, config.obs_vocab_size, bias=False)
         self.head_obs.weight = self.obs_emb.weight
+        self.head_rewards = nn.Linear(config.n_embd, config.reward_vocab)
+        self.head_dones = nn.Linear(config.n_embd, config.done_vocab)
 
-        # Head de reward: 3 classes {-1, 0, +1}
-        self.head_rewards = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
-            nn.ReLU(),
-            nn.Linear(config.n_embd, config.reward_vocab),
-        )
+        mask = torch.triu(torch.ones(config.block_size, config.block_size), diagonal=1).bool()
+        self.register_buffer("causal_mask", mask)
+        self._init_weights()
 
-        # Head de done: 2 classes {0, 1}
-        self.head_ends = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
-            nn.ReLU(),
-            nn.Linear(config.n_embd, config.done_vocab),
-        )
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def _embed(self, obs_tokens, act_tokens):
-        """
-        Monta sequencia intercalando embeddings por bloco.
-
-        obs_tokens : (B, T, 64)
-        act_tokens : (B, T)
-
-        Retorna: (B, T*65, n_embd)
-        """
-        B, T, K = obs_tokens.shape
-        device   = obs_tokens.device
-
-        obs_e = self.obs_emb(obs_tokens)               # (B, T, 64, n_embd)
-        act_e = self.act_emb(act_tokens).unsqueeze(2)  # (B, T,  1, n_embd)
-
-        # (B, T, 65, n_embd) -> (B, T*65, n_embd)
+        B, T, _ = obs_tokens.shape
+        obs_e = self.obs_emb(obs_tokens)
+        act_e = self.act_emb(act_tokens).unsqueeze(2)
         x = torch.cat([obs_e, act_e], dim=2).view(
             B, T * self.config.tokens_per_block, self.config.n_embd
         )
-
-        pos = torch.arange(x.size(1), device=device)
+        pos = torch.arange(x.size(1), device=obs_tokens.device)
         return self.drop(x + self.pos_emb(pos))
 
-    def forward(self, obs_tokens, act_tokens):
-        """
-        obs_tokens : (B, T, 64)  long
-        act_tokens : (B, T)      long
+    def _transform(self, obs_tokens, act_tokens):
+        x = self._embed(obs_tokens, act_tokens)
+        seq_len = x.size(1)
+        mask = self.causal_mask[:seq_len, :seq_len]
+        x = self.transformer(x, mask=mask, is_causal=True)
+        return x
 
-        Retorna:
-            logits_obs     : (B, T, 64, obs_vocab_size)
-            logits_rewards : (B, T, 3)
-            logits_ends    : (B, T, 2)
-        """
-        B, T, K = obs_tokens.shape
-        tpb      = self.config.tokens_per_block  
+    def compute_loss(self, obs_ctx, act_ctx, obs_target, reward_target, done_target):
+        B, T, K = obs_ctx.shape
+        device = obs_ctx.device
 
-        x = self._embed(obs_tokens, act_tokens) 
+        act_target = torch.zeros(B, 1, dtype=torch.long, device=device)
+        full_obs = torch.cat([obs_ctx, obs_target.unsqueeze(1)], dim=1)
+        full_act = torch.cat([act_ctx, act_target], dim=1)
 
-        for block in self.blocks:
-            x = block(x)
-        x = self.ln_f(x)
+        x = self._transform(full_obs, full_act)
+        x = x.view(B, T + 1, self.config.tokens_per_block, self.config.n_embd)
 
-        # Reorganiza em blocos: (B, T, 17, n_embd)
-        x = x.view(B, T, tpb, self.config.n_embd)
-
-        # Posicoes 0..15 de cada bloco: tokens visuais
-        logits_obs = self.head_obs(x[:, :, :K, :])    # (B, T, 16, obs_vocab)
-
-        # Posicao 16 de cada bloco: acao — usada para reward e done
-        act_repr       = x[:, :, K, :]                 # (B, T, n_embd)
-        logits_rewards = self.head_rewards(act_repr)    # (B, T, 3)
-        logits_ends    = self.head_ends(act_repr)       # (B, T, 2)
-
-        return logits_obs, logits_rewards, logits_ends
-
-    def compute_loss(self, obs_tokens, act_tokens, rewards_sign, dones):
-        """
-        obs_tokens   : (B, T, 64)  long
-        act_tokens   : (B, T)      long
-        rewards_sign : (B, T)      long — {0=negativo, 1=neutro, 2=positivo}
-        dones        : (B, T)      long — {0, 1}
-
-        Retorna: loss total e losses individuais para logging
-        """
-        B, T, K = obs_tokens.shape
-
-        logits_obs, logits_rewards, logits_ends = self.forward(obs_tokens, act_tokens)
-
-        obs_stream = obs_tokens.reshape(B, T * K)                   
-        log_stream = logits_obs.reshape(B, T * K, -1)       
+        target_repr = x[:, -1, :K, :]
+        logits_target = self.head_obs(target_repr)
+        ctx_last_repr = x[:, -2, -1, :]
+        ctx_logits = self.head_obs(ctx_last_repr).unsqueeze(1)
+        obs_logits = torch.cat([ctx_logits, logits_target[:, :-1, :]], dim=1)
 
         loss_obs = F.cross_entropy(
-            log_stream[:, :-1].reshape(-1, self.config.obs_vocab_size),
-            obs_stream[:, 1:].reshape(-1),
+            obs_logits.reshape(-1, self.config.obs_vocab_size),
+            obs_target.reshape(-1),
         )
+        loss_rewards = F.cross_entropy(self.head_rewards(ctx_last_repr), reward_target)
+        loss_dones = F.cross_entropy(self.head_dones(ctx_last_repr), done_target)
+        loss = loss_obs + loss_rewards + loss_dones
+        return loss, loss_obs, loss_rewards, loss_dones
 
-        #  Loss reward 
-        loss_rewards = F.cross_entropy(
-            logits_rewards.reshape(-1, self.config.reward_vocab),
-            rewards_sign.reshape(-1),
+    def configure_optimizers(self, weight_decay, learning_rate, betas=(0.9, 0.95)):
+        decay = [p for _, p in self.named_parameters() if p.requires_grad and p.dim() >= 2]
+        nodecay = [p for _, p in self.named_parameters() if p.requires_grad and p.dim() < 2]
+        return torch.optim.AdamW(
+            [
+                {"params": decay, "weight_decay": weight_decay},
+                {"params": nodecay, "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=betas,
         )
-
-        #  Loss done
-        loss_ends = F.cross_entropy(
-            logits_ends.reshape(-1, self.config.done_vocab),
-            dones.reshape(-1),
-        )
-
-        loss = loss_obs + loss_rewards + loss_ends
-        return loss, loss_obs, loss_rewards, loss_ends
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas):
-        decay   = [p for n, p in self.named_parameters() if p.requires_grad and p.dim() >= 2]
-        nodecay = [p for n, p in self.named_parameters() if p.requires_grad and p.dim() < 2]
-        groups  = [
-            {'params': decay,   'weight_decay': weight_decay},
-            {'params': nodecay, 'weight_decay': 0.0},
-        ]
-        return torch.optim.AdamW(groups, lr=learning_rate, betas=betas)
 
     @torch.no_grad()
-    def imagine_next_frame(self, obs_tokens, act_token, temperature=1.0, top_k=50):
-        """
-        Dado historico de frames e a proxima acao, imagina os 16 tokens
-        do proximo frame autorregressivamente.
-
-        obs_tokens : (1, T, 16)  long  — historico de tokens visuais
-        act_token  : (1,)        long  — acao a tomar no proximo passo
-
-        Retorna:
-            next_obs   : (1, 16)  — tokens do frame imaginado
-            reward_pred: int      — reward predito {-1, 0, +1}
-            done_pred  : bool     — done predito
-        """
-        config = self.config
-        device = obs_tokens.device
+    def imagine_next_frame(self, obs_tokens, act_tokens, act_token, temperature=1.0, top_k=50):
         B, T, K = obs_tokens.shape
+        device = obs_tokens.device
 
-        next_obs   = torch.zeros(B, 1, K, dtype=torch.long, device=device)
-        act_tokens = torch.cat([
-            torch.zeros(B, T, dtype=torch.long, device=device),
-            act_token.unsqueeze(1)
-        ], dim=1)  # (B, T+1)
+        next_frame = torch.zeros(B, 1, K, dtype=torch.long, device=device)
+        ctx_obs = torch.cat([obs_tokens, next_frame], dim=1)
+        ctx_act = torch.cat([act_tokens, act_token.unsqueeze(1)], dim=1)
 
-        ctx_obs = torch.cat([obs_tokens, next_obs], dim=1)  
+        x_ctx = self._transform(obs_tokens, act_tokens).view(
+            B, T, self.config.tokens_per_block, self.config.n_embd
+        )
+        ctx_last_repr = x_ctx[:, -1, -1, :]
+        reward_pred = self.head_rewards(ctx_last_repr).argmax(dim=-1)
+        done_pred = self.head_dones(ctx_last_repr).argmax(dim=-1)
 
-        # Gera token por token de forma autorregressiva
         for k in range(K):
-            logits_obs, logits_rew, logits_end = self.forward(ctx_obs, act_tokens)
+            x = self._transform(ctx_obs, ctx_act)
+            x = x.view(B, T + 1, self.config.tokens_per_block, self.config.n_embd)
 
-            # Logits do token k do ultimo bloco
-            next_logits = logits_obs[:, -1, k, :] / temperature
+            if k == 0:
+                repr_k = x[:, -2, -1, :]
+            else:
+                repr_k = x[:, -1, k - 1, :]
 
+            logits = self.head_obs(repr_k) / temperature
             if top_k is not None:
-                v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
-                next_logits[next_logits < v[:, [-1]]] = -float('inf')
-
-            probs = F.softmax(next_logits, dim=-1)
-            token = torch.multinomial(probs, num_samples=1).squeeze(1)  # (B,)
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("inf")
+            token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).squeeze(1)
             ctx_obs[:, -1, k] = token
 
-        next_obs    = ctx_obs[:, -1, :]  
-
-        # Reward e done do ultimo bloco
-        _, logits_rew, logits_end = self.forward(ctx_obs, act_tokens)
-        reward_bin  = logits_rew[:, -1, :].argmax(dim=-1)   # {0,1,2}
-        reward_pred = (reward_bin.float() - 1)               # {-1,0,+1}
-        done_pred   = logits_end[:, -1, :].argmax(dim=-1).bool()
-
-        return next_obs, reward_pred, done_pred
+        return ctx_obs[:, -1, :], reward_pred, done_pred

@@ -1,5 +1,9 @@
 """
-Treino do Dynamics GPT (imagem + reward + done).
+Treino do Dynamics GPT (imagem + reward + done), com validacao periodica.
+
+Uso:
+    python -m models.dynamics.traingpt --dataset_path dataset_tokens
+    python -m models.dynamics.traingpt --dataset_path dataset_tokens --overfit_test
 """
 
 import os
@@ -10,9 +14,13 @@ import torch
 from tqdm import tqdm
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torchvision.utils import save_image, make_grid
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
 from models.dynamics.dataset import CarRacingTokenDataset
+
+
+REWARD_LABEL = {0: "neg (-1)", 1: "neutro (0)", 2: "pos (+1)"}
 
 
 def evaluate(model, dataloader, device):
@@ -37,8 +45,40 @@ def evaluate(model, dataloader, device):
     return {k: v / n for k, v in tot.items()}
 
 
+def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20):
+    """Sonha n_frames a partir do contexto, salva o grid de imagens decodificadas
+    pelo VQ-VAE e imprime a sequencia de reward/done previstos junto."""
+    model.eval()
+    with torch.no_grad():
+        ctx_obs = obs_ctx[0:1]    # (1, context_len, 64)
+        ctx_act = act_ctx[0:1]    # (1, context_len)
+        frames, rewards, dones = [], [], []
+
+        for i in range(n_frames):
+            next_act = act_ctx[0:1, min(i, act_ctx.shape[1] - 1)]
+            next_obs, rew_cls, done_cls = model.imagine_next_frame(ctx_obs, ctx_act, next_act)
+
+            frames.append(next_obs)
+            rewards.append(rew_cls.item())
+            dones.append(done_cls.item())
+
+            ctx_obs = torch.cat([ctx_obs[:, 1:, :], next_obs.unsqueeze(1)], dim=1)
+            ctx_act = torch.cat([ctx_act[:, 1:], next_act.unsqueeze(1)], dim=1)
+
+        all_tok = torch.cat(frames, dim=0)         # (N, 64)
+        decoded = vqvae.decode_indices(all_tok)    # (N, 3, 64, 64)
+        grid = make_grid(decoded.cpu(), nrow=10, normalize=True, value_range=(0, 1))
+        save_image(grid, save_path)
+
+        print("  -> Sonho (reward/done previstos):")
+        print("     reward:", [REWARD_LABEL[r] for r in rewards])
+        print("     done  :", dones)
+
+
 def train_gpt(args):
     os.makedirs(args.save_dir, exist_ok=True)
+    img_dir = os.path.join(args.save_dir, "dreams")
+    os.makedirs(img_dir, exist_ok=True)
     ckpt_path = os.path.join(args.save_dir, "gpt_ckpt.pt")
     best_path = os.path.join(args.save_dir, "gpt_best.pt")
     device = args.device
@@ -70,6 +110,9 @@ def train_gpt(args):
     optimizer = model.configure_optimizers(weight_decay=0.01, learning_rate=args.lr)
     scaler = GradScaler(device_type)
 
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parametros: {n_params:,}")
+
     start_epoch = 0
     global_step = 0
     best_val = float("inf")
@@ -81,9 +124,12 @@ def train_gpt(args):
         start_epoch = ckpt["epoch"] + 1
         global_step = ckpt.get("global_step", 0)
         best_val = ckpt.get("best_val_loss", float("inf"))
-        print(f"Continuando da epoca {start_epoch}")
+        print(f"Continuando da epoca {start_epoch} | melhor val: {best_val:.4f}")
+    else:
+        print("Iniciando do zero.")
 
     if args.overfit_test:
+        print("\nModo OVERFIT (sanity check)...")
         model.train()
         obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt = [b.to(device) for b in next(iter(train_loader))]
         for step in range(3000):
@@ -93,21 +139,38 @@ def train_gpt(args):
             optimizer.step()
             if step % 500 == 0:
                 print(
-                    f"step {step:>4} | total {loss.item():.4f} | "
+                    f"  step {step:>4} | total {loss.item():.4f} | "
                     f"obs {l_obs.item():.4f} | rew {l_rew.item():.4f} | done {l_done.item():.4f}"
                 )
+        print("Overfit test concluido. Esperado: obs/rew/done proximos de 0.")
         return
+
+    vqvae = None
+    if os.path.exists(args.vqvae_path):
+        try:
+            from models.encoder.modules import VQVAE
+            vqvae = VQVAE(in_channels=3, latent_dim=256, num_embeddings=args.vocab_size).to(device)
+            vqvae.load_state_dict(
+                torch.load(args.vqvae_path, map_location=device, weights_only=True)["model_state_dict"]
+            )
+            vqvae.eval()
+            print("VQ-VAE carregado.")
+        except Exception as e:
+            print(f"Aviso VQ-VAE: {e}")
 
     print("\nIniciando treino...")
     for epoch in range(start_epoch, args.epochs):
         model.train()
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
+        last_batch = None
+
         for obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt in pbar:
             obs_ctx = obs_ctx.to(device)
             act_ctx = act_ctx.to(device)
             obs_tgt = obs_tgt.to(device)
             rew_tgt = rew_tgt.to(device)
             done_tgt = done_tgt.to(device)
+            last_batch = (obs_ctx, act_ctx)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type=device_type):
@@ -146,6 +209,15 @@ def train_gpt(args):
             )
             print(f"  -> Novo melhor modelo ({best_val:.4f})")
 
+        if epoch % 5 == 0 and vqvae is not None and last_batch is not None:
+            try:
+                obs_ctx, act_ctx = last_batch
+                save_path = os.path.join(img_dir, f"dream_{epoch:05d}.png")
+                save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device)
+                print(f"  -> Imagem: {save_path}")
+            except Exception as e:
+                print(f"  Aviso viz: {e}")
+
         torch.save(
             {
                 "epoch": epoch,
@@ -173,6 +245,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_path", type=str, required=True)
     p.add_argument("--save_dir", type=str, default="models/dynamics")
+    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
     p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--vocab_size", type=int, default=512)

@@ -1,4 +1,6 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import torch
@@ -96,7 +98,8 @@ def train(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4
     )
     val_loader = DataLoader(
         val_dataset,
@@ -104,7 +107,8 @@ def train(args):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4
     )
 
     model = VQVAE(
@@ -287,7 +291,7 @@ def main():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=128
+        default=32
     )
 
     parser.add_argument(

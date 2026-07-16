@@ -1,4 +1,5 @@
 import os
+import bisect
 import numpy as np
 import torch
 
@@ -13,8 +14,8 @@ class CarRacingDataset(Dataset):
         self,
         folder_path,
         split:       str   = "train",
-        train_ratio: float = 0.7,
-        val_ratio:   float = 0.15,
+        train_ratio: float = 0.15,
+        val_ratio:   float = 0.05,
         seed:        int   = 42,
         max_files:   int   = None,
     ):
@@ -44,48 +45,33 @@ class CarRacingDataset(Dataset):
         else:
             selected = files[n_train+n_val:]
 
-        self.folder_path = folder_path
-        self.index_map   = []
-
         print(f"[{split:>5}] {len(selected)}/{n} episodios")
 
-        # --------------------------------------------------
-        # Cria mapeamento global:
-        #
-        # idx global -> (arquivo, frame_idx)
-        # --------------------------------------------------
+        self.folder_path      = folder_path
+        self.files            = selected
+        self.episode_offsets  = [0]
 
         for fname in selected:
-
             path = os.path.join(folder_path, fname)
-
-            # mmap_mode evita carregar tudo
             data = np.load(path, mmap_mode="r")
+            T    = data["obs"].shape[0]
+            self.episode_offsets.append(self.episode_offsets[-1] + T)
 
-            T = data["obs"].shape[0]
-
-            for frame_idx in range(T):
-                self.index_map.append(
-                    (path, frame_idx)
-                )
-
-        print(f"✅ {len(self.index_map)} frames indexados")
+        print(f"✅ {self.episode_offsets[-1]} frames indexados")
 
     def __len__(self):
-        return len(self.index_map)
+        return self.episode_offsets[-1]
 
     def __getitem__(self, idx):
+        ep_idx    = bisect.bisect_right(self.episode_offsets, idx) - 1
+        frame_idx = idx - self.episode_offsets[ep_idx]
 
-        path, frame_idx = self.index_map[idx]
-
-        # carrega somente UM frame
+        path = os.path.join(self.folder_path, self.files[ep_idx])
         data = np.load(path, mmap_mode="r")
 
-        frame = data["obs"][frame_idx]
-
-        frame = frame.astype(np.float32)
+        frame = np.array(data["obs"][frame_idx]).astype(np.float32)
 
         if frame.max() > 1.0:
-            frame = frame / 255.0
+            frame /= 255.0
 
         return torch.from_numpy(frame).float()

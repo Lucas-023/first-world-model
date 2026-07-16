@@ -1,0 +1,7 @@
+torch==2.7.1
+torchvision==0.22.1
+numpy==2.4.4
+tqdm==4.67.1
+pillow==12.0.0
+vector-quantize-pytorch==1.28.2
+tensorboard==2.20.0

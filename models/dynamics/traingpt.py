@@ -25,6 +25,7 @@ REWARD_LABEL = {0: "neg (-1)", 1: "neutro (0)", 2: "pos (+1)"}
 
 def evaluate(model, dataloader, device):
     model.eval()
+    device_type = device.split(":")[0]
     tot = {"loss": 0.0, "obs": 0.0, "rew": 0.0, "done": 0.0}
     n = 0
     with torch.no_grad():
@@ -34,7 +35,8 @@ def evaluate(model, dataloader, device):
             obs_tgt = obs_tgt.to(device)
             rew_tgt = rew_tgt.to(device)
             done_tgt = done_tgt.to(device)
-            loss, l_obs, l_rew, l_done = model.compute_loss(obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt)
+            with autocast(device_type=device_type):
+                loss, l_obs, l_rew, l_done = model.compute_loss(obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt)
             tot["loss"] += loss.item()
             tot["obs"] += l_obs.item()
             tot["rew"] += l_rew.item()
@@ -98,7 +100,7 @@ def train_gpt(args):
     print(f"Tokens por bloco : {config.tokens_per_block}")
     print(f"Block size       : {config.block_size}")
 
-    train_ds = CarRacingTokenDataset(args.dataset_path, split="train", context_len=args.context_len, seed=args.seed)
+    train_ds = CarRacingTokenDataset(args.dataset_path, split="train", context_len=args.context_len, seed=args.seed, stride=args.stride)
     val_ds = CarRacingTokenDataset(args.dataset_path, split="val", context_len=args.context_len, seed=args.seed)
     test_ds = CarRacingTokenDataset(args.dataset_path, split="test", context_len=args.context_len, seed=args.seed)
 
@@ -257,6 +259,7 @@ if __name__ == "__main__":
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--vocab_size", type=int, default=512)
     p.add_argument("--context_len", type=int, default=19)
+    p.add_argument("--stride", type=int, default=1, help="passo da janela deslizante no split de treino (val/test sempre stride=1)")
     p.add_argument("--n_embd", type=int, default=256)
     p.add_argument("--n_head", type=int, default=4)
     p.add_argument("--n_layer", type=int, default=6)

@@ -27,9 +27,11 @@ class CarRacingTokenDataset(Dataset):
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
         seed: int = 42,
+        stride: int = 1,
     ):
         assert split in self.SPLITS, f"split deve ser um de {self.SPLITS}"
         assert train_ratio + val_ratio < 1.0
+        assert stride >= 1
 
         self.context_len = context_len
         self.chunks = []
@@ -63,7 +65,7 @@ class CarRacingTokenDataset(Dataset):
             if T < context_len + 1:
                 continue
 
-            for i in range(T - context_len):
+            for i in range(0, T - context_len, stride):
                 obs_ctx = tokens[i:i + context_len]                   # (context_len, 64)
                 act_ctx = actions[i:i + context_len]                  # (context_len,)
                 obs_target = tokens[i + context_len]                  # (64,)
@@ -71,7 +73,7 @@ class CarRacingTokenDataset(Dataset):
                 done_target = dones[i + context_len]                  # ()
                 self.chunks.append((obs_ctx, act_ctx, obs_target, reward_target, done_target))
 
-        print(f"[{split:>5}] {len(self.chunks)} janelas (contexto={context_len})")
+        print(f"[{split:>5}] {len(self.chunks)} janelas (contexto={context_len}, stride={stride})")
 
     def __len__(self):
         return len(self.chunks)

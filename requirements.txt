@@ -1,5 +1,18 @@
-torch==2.7.1
-torchvision==0.22.1
+# torch e torchvision NAO estao aqui de proposito: a build certa (CPU ou GPU)
+# depende do driver CUDA da maquina. Instale-os primeiro, separadamente.
+#
+# VM com driver CUDA 13.0:
+#   pip install torch==2.11.0 torchvision==0.26.0 --extra-index-url https://download.pytorch.org/whl/cu130
+#   (use --extra-index-url, nao --index-url: o indice cu130 sozinho falta a
+#    dependencia cuda-bindings==13.0.3 e a instalacao quebra)
+#
+# Se isso falhar, caia para cu128 (build mais antiga, roda normalmente em driver 13.0):
+#   pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# Confirme depois: python -c "import torch; print(torch.cuda.is_available())"
+#
+# Só depois rode: pip install -r requirements.txt
+
 numpy==2.4.4
 tqdm==4.67.1
 pillow==12.0.0

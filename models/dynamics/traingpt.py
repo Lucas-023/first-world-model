@@ -102,9 +102,15 @@ def train_gpt(args):
     val_ds = CarRacingTokenDataset(args.dataset_path, split="val", context_len=args.context_len, seed=args.seed)
     test_ds = CarRacingTokenDataset(args.dataset_path, split="test", context_len=args.context_len, seed=args.seed)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
+    )
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
 
     model = WorldModel(config).to(device)
     optimizer = model.configure_optimizers(weight_decay=0.01, learning_rate=args.lr)
@@ -248,6 +254,7 @@ if __name__ == "__main__":
     p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
     p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--vocab_size", type=int, default=512)
     p.add_argument("--context_len", type=int, default=19)
     p.add_argument("--n_embd", type=int, default=256)

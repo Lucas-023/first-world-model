@@ -17,6 +17,7 @@ import glob
 import time
 import numpy as np
 import torch
+from torch.amp import autocast
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
 
@@ -43,22 +44,12 @@ def load_world_model(ckpt_path, device):
     return model, config
 
 
-@torch.no_grad()
-def evaluate_rollout(model, config, files, device, horizon, n_windows, seed):
-    """
-    Junta ate n_windows janelas de episodios distintos num unico batch e
-    imagina os `horizon` passos EM PARALELO (batch=n_windows) -- em vez de
-    n_windows*horizon chamadas sequenciais de imagine_next_frame, sao so
-    `horizon` chamadas (cada uma processando todas as janelas de uma vez).
-    """
-    C = config.context_len
-    rng = np.random.default_rng(seed)
-    file_order = rng.permutation(len(files))
-
+def _collect_windows(files, file_order, context_len, horizon, n_windows):
     obs_ctx_list, act_ctx_list = [], []
     real_obs_list, real_act_list, real_rew_list, real_done_list = [], [], [], []
     persist_rew_list, persist_done_list = [], []
 
+    rng = np.random.default_rng(0)  # so pra escolher o offset dentro de cada episodio
     for fi in file_order:
         if len(obs_ctx_list) >= n_windows:
             break
@@ -69,6 +60,7 @@ def evaluate_rollout(model, config, files, device, horizon, n_windows, seed):
         rewards_sign = (np.sign(d["rewards"].astype(np.float32)) + 1).astype(np.int64)
 
         T = tokens.shape[0]
+        C = context_len
         if T < C + horizon:
             continue
 
@@ -82,15 +74,70 @@ def evaluate_rollout(model, config, files, device, horizon, n_windows, seed):
         persist_rew_list.append(rewards_sign[i + C - 1])
         persist_done_list.append(dones_raw[i + C - 1])
 
-    B = len(obs_ctx_list)
-    obs_ctx = torch.from_numpy(np.stack(obs_ctx_list)).long().to(device)
-    act_ctx = torch.from_numpy(np.stack(act_ctx_list)).long().to(device)
-    real_obs = np.stack(real_obs_list)      # (B,horizon,64)
-    real_act = np.stack(real_act_list)      # (B,horizon)
-    real_rew = np.stack(real_rew_list)      # (B,horizon)
-    real_done = np.stack(real_done_list)    # (B,horizon)
-    persist_rew = np.array(persist_rew_list)
-    persist_done = np.array(persist_done_list)
+    return (
+        np.stack(obs_ctx_list), np.stack(act_ctx_list),
+        np.stack(real_obs_list), np.stack(real_act_list),
+        np.stack(real_rew_list), np.stack(real_done_list),
+        np.array(persist_rew_list), np.array(persist_done_list),
+    )
+
+
+@torch.no_grad()
+def _run_chunk(model, device, obs_ctx_np, act_ctx_np, real_obs, real_act, real_rew, real_done, horizon):
+    """Roda o rollout de `horizon` passos pra um chunk de janelas (ja em memoria, batch pequeno o
+    suficiente pra caber na GPU). Autocast igual ao treino -- sem isso, o forward roda em fp32
+    puro e a matriz de atencao (batch x 1300 x 1300) estoura a memoria em batches grandes."""
+    device_type = device.split(":")[0]
+    obs_ctx = torch.from_numpy(obs_ctx_np).long().to(device)
+    act_ctx = torch.from_numpy(act_ctx_np).long().to(device)
+
+    B = obs_ctx_np.shape[0]
+    obs_correct = np.zeros(horizon)
+    obs_total = np.zeros(horizon)
+    rew_correct = np.zeros(horizon)
+    done_correct = np.zeros(horizon)
+    reward_confusion = np.zeros((3, 3), dtype=np.int64)
+    done_confusion = np.zeros((2, 2), dtype=np.int64)
+
+    for s in range(horizon):
+        act_token = torch.from_numpy(real_act[:, s]).long().to(device)
+        with autocast(device_type=device_type):
+            next_obs, reward_pred, done_pred = model.imagine_next_frame(obs_ctx, act_ctx, act_token)
+
+        next_obs_np = next_obs.cpu().numpy()
+        reward_pred_np = reward_pred.cpu().numpy()
+        done_pred_np = done_pred.cpu().numpy()
+
+        obs_correct[s] += (next_obs_np == real_obs[:, s]).sum()
+        obs_total[s] += real_obs[:, s].size
+        rew_correct[s] += (reward_pred_np == real_rew[:, s]).sum()
+        done_correct[s] += (done_pred_np == real_done[:, s]).sum()
+
+        for b in range(B):
+            reward_confusion[real_rew[b, s], reward_pred_np[b]] += 1
+            done_confusion[real_done[b, s], done_pred_np[b]] += 1
+
+        obs_ctx = torch.cat([obs_ctx[:, 1:], next_obs.unsqueeze(1)], dim=1)
+        act_ctx = torch.cat([act_ctx[:, 1:], act_token.unsqueeze(1)], dim=1)
+
+    return obs_correct, obs_total, rew_correct, done_correct, reward_confusion, done_confusion
+
+
+def evaluate_rollout(model, config, files, device, horizon, n_windows, seed, eval_batch_size=64):
+    """
+    Junta ate n_windows janelas de episodios distintos e imagina os `horizon`
+    passos em chunks de `eval_batch_size` (em vez de n_windows*horizon
+    chamadas sequenciais de imagine_next_frame, sao so
+    horizon * ceil(n_windows/eval_batch_size) -- e cada chunk cabe na GPU).
+    """
+    C = config.context_len
+    rng = np.random.default_rng(seed)
+    file_order = rng.permutation(len(files))
+
+    obs_ctx, act_ctx, real_obs, real_act, real_rew, real_done, persist_rew, persist_done = _collect_windows(
+        files, file_order, C, horizon, n_windows
+    )
+    B = obs_ctx.shape[0]
 
     obs_correct = np.zeros(horizon)
     obs_total = np.zeros(horizon)
@@ -101,27 +148,28 @@ def evaluate_rollout(model, config, files, device, horizon, n_windows, seed):
     reward_confusion = np.zeros((3, 3), dtype=np.int64)
     done_confusion = np.zeros((2, 2), dtype=np.int64)
 
-    for s in range(horizon):
-        act_token = torch.from_numpy(real_act[:, s]).long().to(device)
-        next_obs, reward_pred, done_pred = model.imagine_next_frame(obs_ctx, act_ctx, act_token)
+    for start in range(0, B, eval_batch_size):
+        end = min(start + eval_batch_size, B)
+        c_obs_correct, c_obs_total, c_rew_correct, c_done_correct, c_rew_conf, c_done_conf = _run_chunk(
+            model, device,
+            obs_ctx[start:end], act_ctx[start:end],
+            real_obs[start:end], real_act[start:end], real_rew[start:end], real_done[start:end],
+            horizon,
+        )
+        obs_correct += c_obs_correct
+        obs_total += c_obs_total
+        rew_correct += c_rew_correct
+        done_correct += c_done_correct
+        reward_confusion += c_rew_conf
+        done_confusion += c_done_conf
 
-        next_obs_np = next_obs.cpu().numpy()
-        reward_pred_np = reward_pred.cpu().numpy()
-        done_pred_np = done_pred.cpu().numpy()
-
-        obs_correct[s] += (next_obs_np == real_obs[:, s]).sum()
-        obs_total[s] += real_obs[:, s].size
-        rew_correct[s] += (reward_pred_np == real_rew[:, s]).sum()
-        done_correct[s] += (done_pred_np == real_done[:, s]).sum()
-        persist_rew_correct[s] += (persist_rew == real_rew[:, s]).sum()
-        persist_done_correct[s] += (persist_done == real_done[:, s]).sum()
-
-        for b in range(B):
-            reward_confusion[real_rew[b, s], reward_pred_np[b]] += 1
-            done_confusion[real_done[b, s], done_pred_np[b]] += 1
-
-        obs_ctx = torch.cat([obs_ctx[:, 1:], next_obs.unsqueeze(1)], dim=1)
-        act_ctx = torch.cat([act_ctx[:, 1:], act_token.unsqueeze(1)], dim=1)
+        chunk_rew = real_rew[start:end]
+        chunk_done = real_done[start:end]
+        chunk_persist_rew = persist_rew[start:end]
+        chunk_persist_done = persist_done[start:end]
+        for s in range(horizon):
+            persist_rew_correct[s] += (chunk_persist_rew == chunk_rew[:, s]).sum()
+            persist_done_correct[s] += (chunk_persist_done == chunk_done[:, s]).sum()
 
     return {
         "obs_acc": obs_correct / np.maximum(obs_total, 1),
@@ -141,6 +189,7 @@ def main():
     p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/gpt_best.pt")
     p.add_argument("--horizon", type=int, default=20)
     p.add_argument("--n_windows", type=int, default=200)
+    p.add_argument("--eval_batch_size", type=int, default=64, help="quantas janelas processar de uma vez na GPU (chunk); reduza se der OOM")
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--output_file", type=str, default=None, help="onde salvar o .txt com o resultado; se omitido, gera um nome com timestamp")
@@ -157,7 +206,7 @@ def main():
     emit(f"Checkpoint: {args.dynamics_ckpt}")
     emit(f"Avaliando em {len(files)} episodios de teste (ate {args.n_windows} janelas, horizon={args.horizon}, context_len={config.context_len})")
 
-    result = evaluate_rollout(model, config, files, args.device, args.horizon, args.n_windows, args.seed)
+    result = evaluate_rollout(model, config, files, args.device, args.horizon, args.n_windows, args.seed, args.eval_batch_size)
 
     emit(f"\n{result['n_windows']} janelas avaliadas.\n")
     emit(f"{'passo':>5} | {'obs_acc':>8} | {'rew_acc':>8} | {'rew_persist':>11} | {'done_acc':>8} | {'done_persist':>12}")

@@ -59,7 +59,9 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20, b
         frames, rewards, dones = [], [], []
 
         for i in range(n_frames):
-            next_act = act_ctx[0:1, min(i, act_ctx.shape[1] - 1)]
+            # acao aleatoria a cada passo -- antes repetia pra sempre a ultima
+            # acao real do contexto, o que so testava "segurar um botao"
+            next_act = torch.randint(0, model.config.act_vocab_size, (1,), device=device)
             next_obs, rew_cls, done_cls = model.imagine_next_frame(ctx_obs, ctx_act, next_act)
 
             frames.append(next_obs)
@@ -84,7 +86,7 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20, b
 
 def train_gpt(args):
     os.makedirs(args.save_dir, exist_ok=True)
-    img_dir = os.path.join(args.save_dir, "dreams")
+    img_dir = os.path.join(args.save_dir, "dreams", args.run_name)
     os.makedirs(img_dir, exist_ok=True)
     ckpt_path = os.path.join(args.save_dir, "gpt_ckpt.pt")
     best_path = os.path.join(args.save_dir, "gpt_best.pt")

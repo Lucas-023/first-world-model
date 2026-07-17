@@ -85,11 +85,13 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20, b
 
 
 def train_gpt(args):
-    os.makedirs(args.save_dir, exist_ok=True)
-    img_dir = os.path.join(args.save_dir, "dreams", args.run_name)
+    run_dir = os.path.join(args.save_dir, args.run_name)
+    img_dir = os.path.join(run_dir, "dreams")
+    weights_dir = os.path.join(run_dir, "pesos")
     os.makedirs(img_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.save_dir, "gpt_ckpt.pt")
-    best_path = os.path.join(args.save_dir, "gpt_best.pt")
+    os.makedirs(weights_dir, exist_ok=True)
+    ckpt_path = os.path.join(weights_dir, "gpt_ckpt.pt")
+    best_path = os.path.join(weights_dir, "gpt_best.pt")
     device = args.device
     device_type = device.split(":")[0]
 
@@ -134,9 +136,9 @@ def train_gpt(args):
     start_epoch = 0
     global_step = 0
     best_val = float("inf")
-    if os.path.exists(ckpt_path):
-        print(f"Retomando de: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    if args.resume_ckpt:
+        print(f"Retomando de: {args.resume_ckpt}")
+        ckpt = torch.load(args.resume_ckpt, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_epoch = ckpt["epoch"] + 1
@@ -274,6 +276,7 @@ if __name__ == "__main__":
     p.add_argument("--dataset_path", type=str, required=True)
     p.add_argument("--save_dir", type=str, default="models/dynamics")
     p.add_argument("--run_name", type=str, default="DYNAMICS_GPT")
+    p.add_argument("--resume_ckpt", type=str, default=None, help="caminho pro checkpoint pra retomar treino; se omitido, comeca do zero")
     p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
     p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=32)

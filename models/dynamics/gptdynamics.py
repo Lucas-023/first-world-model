@@ -131,6 +131,29 @@ class WorldModel(nn.Module):
         )
 
     @torch.no_grad()
+    def encode_state(self, obs_tokens, act_tokens):
+        """
+        Representacao compacta do contexto (B,n_embd) + logits de reward/done.
+
+        obs_tokens: (B,T,64), act_tokens: (B,T).
+
+        Importante: reward_logits/done_logits aqui descrevem a transicao JA
+        COMMITADA por act_tokens[:, -1] -- nao uma acao futura. E a mesma
+        leitura que compute_loss usa pra treinar head_rewards/head_dones
+        (ctx_last_repr = posicao da ultima acao do contexto). act_tokens[:,-1]
+        so tem efeito causal na chamada SEGUINTE, depois que ele entra na
+        janela deslizante -- ele e causalmente inerte dentro desta mesma
+        chamada (nenhuma posicao usada aqui consegue "ver" alem da propria
+        ultima acao do contexto).
+        """
+        B, T, K = obs_tokens.shape
+        x = self._transform(obs_tokens, act_tokens).view(
+            B, T, self.config.tokens_per_block, self.config.n_embd
+        )
+        state_repr = x[:, -1, -1, :]
+        return state_repr, self.head_rewards(state_repr), self.head_dones(state_repr)
+
+    @torch.no_grad()
     def imagine_next_frame(self, obs_tokens, act_tokens, act_token, temperature=1.0, top_k=50):
         B, T, K = obs_tokens.shape
         device = obs_tokens.device
@@ -139,12 +162,9 @@ class WorldModel(nn.Module):
         ctx_obs = torch.cat([obs_tokens, next_frame], dim=1)
         ctx_act = torch.cat([act_tokens, act_token.unsqueeze(1)], dim=1)
 
-        x_ctx = self._transform(obs_tokens, act_tokens).view(
-            B, T, self.config.tokens_per_block, self.config.n_embd
-        )
-        ctx_last_repr = x_ctx[:, -1, -1, :]
-        reward_pred = self.head_rewards(ctx_last_repr).argmax(dim=-1)
-        done_pred = self.head_dones(ctx_last_repr).argmax(dim=-1)
+        ctx_last_repr, reward_logits, done_logits = self.encode_state(obs_tokens, act_tokens)
+        reward_pred = reward_logits.argmax(dim=-1)
+        done_pred = done_logits.argmax(dim=-1)
 
         for k in range(K):
             x = self._transform(ctx_obs, ctx_act)

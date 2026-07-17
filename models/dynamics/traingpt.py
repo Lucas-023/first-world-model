@@ -18,6 +18,7 @@ from torchvision.utils import save_image, make_grid
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
 from models.dynamics.dataset import CarRacingTokenDataset
+from models.encoder.board import Board
 
 
 REWARD_LABEL = {0: "neg (-1)", 1: "neutro (0)", 2: "pos (+1)"}
@@ -47,9 +48,10 @@ def evaluate(model, dataloader, device):
     return {k: v / n for k, v in tot.items()}
 
 
-def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20):
+def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20, board=None, step=0):
     """Sonha n_frames a partir do contexto, salva o grid de imagens decodificadas
-    pelo VQ-VAE e imprime a sequencia de reward/done previstos junto."""
+    pelo VQ-VAE (e loga no TensorBoard, se um Board for passado) e imprime
+    a sequencia de reward/done previstos junto."""
     model.eval()
     with torch.no_grad():
         ctx_obs = obs_ctx[0:1]    # (1, context_len, 64)
@@ -72,6 +74,9 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20):
         grid = make_grid(decoded.cpu(), nrow=10, normalize=True, value_range=(0, 1))
         save_image(grid, save_path)
 
+        if board is not None:
+            board.log_image("dream/frames", grid, step)
+
         print("  -> Sonho (reward/done previstos):")
         print("     reward:", [REWARD_LABEL[r] for r in rewards])
         print("     done  :", dones)
@@ -85,6 +90,9 @@ def train_gpt(args):
     best_path = os.path.join(args.save_dir, "gpt_best.pt")
     device = args.device
     device_type = device.split(":")[0]
+
+    board = Board(args.run_name)
+    print(f"TensorBoard: tensorboard --logdir runs/{args.run_name}")
 
     config = WorldModelConfig(
         obs_vocab_size=args.vocab_size,
@@ -151,6 +159,7 @@ def train_gpt(args):
                     f"obs {l_obs.item():.4f} | rew {l_rew.item():.4f} | done {l_done.item():.4f}"
                 )
         print("Overfit test concluido. Esperado: obs/rew/done proximos de 0.")
+        board.close()
         return
 
     vqvae = None
@@ -196,6 +205,10 @@ def train_gpt(args):
                 rew=f"{l_rew.item():.4f}",
                 done=f"{l_done.item():.4f}",
             )
+            board.log_scalar("train/total", loss.item(), global_step)
+            board.log_scalar("train/obs", l_obs.item(), global_step)
+            board.log_scalar("train/rew", l_rew.item(), global_step)
+            board.log_scalar("train/done", l_done.item(), global_step)
             global_step += 1
 
         val_metrics = evaluate(model, val_loader, device)
@@ -203,6 +216,10 @@ def train_gpt(args):
             f"[Epoch {epoch:>5}] val total {val_metrics['loss']:.4f} | "
             f"obs {val_metrics['obs']:.4f} | rew {val_metrics['rew']:.4f} | done {val_metrics['done']:.4f}"
         )
+        board.log_scalar("val/total", val_metrics["loss"], epoch)
+        board.log_scalar("val/obs", val_metrics["obs"], epoch)
+        board.log_scalar("val/rew", val_metrics["rew"], epoch)
+        board.log_scalar("val/done", val_metrics["done"], epoch)
 
         if val_metrics["loss"] < best_val:
             best_val = val_metrics["loss"]
@@ -221,7 +238,7 @@ def train_gpt(args):
             try:
                 obs_ctx, act_ctx = last_batch
                 save_path = os.path.join(img_dir, f"dream_{epoch:05d}.png")
-                save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device)
+                save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, board=board, step=epoch)
                 print(f"  -> Imagem: {save_path}")
             except Exception as e:
                 print(f"  Aviso viz: {e}")
@@ -247,12 +264,14 @@ def train_gpt(args):
         f"rew {test_metrics['rew']:.4f} | done {test_metrics['done']:.4f}"
     )
     print("Treino finalizado!")
+    board.close()
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_path", type=str, required=True)
     p.add_argument("--save_dir", type=str, default="models/dynamics")
+    p.add_argument("--run_name", type=str, default="DYNAMICS_GPT")
     p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
     p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=32)

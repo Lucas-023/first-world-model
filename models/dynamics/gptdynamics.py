@@ -153,33 +153,98 @@ class WorldModel(nn.Module):
         state_repr = x[:, -1, -1, :]
         return state_repr, self.head_rewards(state_repr), self.head_dones(state_repr)
 
+    def _project_kv(self, layer, normed_x):
+        """Projeta K,V de uma camada a partir do input ja normalizado (norm_first=True e
+        o mesmo input que layer.self_attn recebe internamente) -- usa os MESMOS pesos
+        (in_proj_weight/bias) que nn.MultiheadAttention usa, sem duplicar parametros."""
+        B, L, d_model = normed_x.shape
+        n_head = layer.self_attn.num_heads
+        head_dim = d_model // n_head
+        _, w_k, w_v = layer.self_attn.in_proj_weight.chunk(3, dim=0)
+        _, b_k, b_v = layer.self_attn.in_proj_bias.chunk(3, dim=0)
+        k = F.linear(normed_x, w_k, b_k).view(B, L, n_head, head_dim).transpose(1, 2)
+        v = F.linear(normed_x, w_v, b_v).view(B, L, n_head, head_dim).transpose(1, 2)
+        return k, v
+
+    def _incremental_layer_step(self, layer, x_new, k_cache, v_cache):
+        """Roda 1 camada do transformer para UM token novo, atendendo ao cache de K,V das
+        posicoes anteriores (em vez de recomputar a sequencia inteira). Replica exatamente
+        TransformerEncoderLayer.forward (norm_first=True) usando os mesmos submodulos/pesos
+        da camada -- so a atencao e feita manualmente pra poder usar o cache.
+        x_new: (B,1,n_embd):  embedding (+pos) do token novo, antes da camada.
+        Retorna (x_out, k_cache, v_cache) com o cache ja estendido."""
+        B, _, d_model = x_new.shape
+        n_head = layer.self_attn.num_heads
+        head_dim = d_model // n_head
+
+        normed = layer.norm1(x_new)
+        w_q, w_k, w_v = layer.self_attn.in_proj_weight.chunk(3, dim=0)
+        b_q, b_k, b_v = layer.self_attn.in_proj_bias.chunk(3, dim=0)
+        q = F.linear(normed, w_q, b_q).view(B, 1, n_head, head_dim).transpose(1, 2)
+        k_new = F.linear(normed, w_k, b_k).view(B, 1, n_head, head_dim).transpose(1, 2)
+        v_new = F.linear(normed, w_v, b_v).view(B, 1, n_head, head_dim).transpose(1, 2)
+
+        k_cache = torch.cat([k_cache, k_new], dim=2)
+        v_cache = torch.cat([v_cache, v_new], dim=2)
+
+        attn = F.scaled_dot_product_attention(q, k_cache, v_cache)
+        attn = attn.transpose(1, 2).reshape(B, 1, d_model)
+        attn = layer.self_attn.out_proj(attn)
+
+        x = x_new + layer.dropout1(attn)
+        normed2 = layer.norm2(x)
+        ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(normed2))))
+        x = x + layer.dropout2(ff)
+        return x, k_cache, v_cache
+
     @torch.no_grad()
     def imagine_next_frame(self, obs_tokens, act_tokens, act_token, temperature=1.0, top_k=50):
+        """Gera os `img_tokens` do proximo frame com KV-cache: 1 forward completo sobre o
+        contexto conhecido (T frames) semeia o cache de cada camada, depois cada token novo
+        so processa a si mesmo (atendendo ao cache), em vez de recomputar a sequencia inteira
+        a cada um dos `img_tokens` passos. Equivalente ao `imagine_next_frame` anterior (ver
+        models/dynamics/test_kv_cache.py), so que sem o trabalho redundante.
+
+        `act_token` (a acao recem-escolhida) nao entra em nenhum calculo aqui de proposito --
+        ela e causalmente inerte dentro desta mesma chamada (ver docstring de encode_state);
+        so importa na chamada SEGUINTE, depois de entrar na janela deslizante. Fica como
+        parametro so por compatibilidade de interface com quem chama."""
         B, T, K = obs_tokens.shape
         device = obs_tokens.device
 
-        next_frame = torch.zeros(B, 1, K, dtype=torch.long, device=device)
-        ctx_obs = torch.cat([obs_tokens, next_frame], dim=1)
-        ctx_act = torch.cat([act_tokens, act_token.unsqueeze(1)], dim=1)
+        x = self._embed(obs_tokens, act_tokens)  # (B, T*tokens_per_block, n_embd), sem o frame novo
+        seq_len = x.size(1)
+        mask = self.causal_mask[:seq_len, :seq_len]
 
-        ctx_last_repr, reward_logits, done_logits = self.encode_state(obs_tokens, act_tokens)
+        kv_cache = []
+        for layer in self.transformer.layers:
+            kv_cache.append(self._project_kv(layer, layer.norm1(x)))
+            x = layer(x, src_mask=mask, is_causal=True)
+
+        h = x[:, -1, :]  # representacao na ultima posicao do contexto conhecido
+        reward_logits = self.head_rewards(h)
+        done_logits = self.head_dones(h)
         reward_pred = reward_logits.argmax(dim=-1)
         done_pred = done_logits.argmax(dim=-1)
 
+        generated = torch.zeros(B, K, dtype=torch.long, device=device)
+        h_cur = h
+
         for k in range(K):
-            x = self._transform(ctx_obs, ctx_act)
-            x = x.view(B, T + 1, self.config.tokens_per_block, self.config.n_embd)
-
-            if k == 0:
-                repr_k = x[:, -2, -1, :]
-            else:
-                repr_k = x[:, -1, k - 1, :]
-
-            logits = self.head_obs(repr_k) / temperature
+            logits = self.head_obs(h_cur) / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float("inf")
             token = torch.multinomial(F.softmax(logits, dim=-1), num_samples=1).squeeze(1)
-            ctx_obs[:, -1, k] = token
+            generated[:, k] = token
 
-        return ctx_obs[:, -1, :], reward_pred, done_pred
+            if k < K - 1:
+                pos = torch.full((1,), seq_len + k, device=device, dtype=torch.long)
+                x_new = self.drop(self.obs_emb(token).unsqueeze(1) + self.pos_emb(pos))
+                for i, layer in enumerate(self.transformer.layers):
+                    k_cache, v_cache = kv_cache[i]
+                    x_new, k_cache, v_cache = self._incremental_layer_step(layer, x_new, k_cache, v_cache)
+                    kv_cache[i] = (k_cache, v_cache)
+                h_cur = x_new.squeeze(1)
+
+        return generated, reward_pred, done_pred

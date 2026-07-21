@@ -9,6 +9,7 @@ action_t) vem de reward_logits_{t+1}, nao de reward_logits_t.
 """
 
 import torch
+from torch.amp import autocast
 
 REWARD_LOOKUP = torch.tensor([-1.0, 0.0, 1.0])  # classe {neg,neutro,pos} -> escalar
 
@@ -62,29 +63,32 @@ def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=
     dones, active_mask, advantages, returns.
     """
     device = obs_ctx.device
+    device_type = device.type
     reward_lookup = REWARD_LOOKUP.to(device)
 
     states, actions, log_probs, values = [], [], [], []
     reward_logits_list, done_logits_list = [], []
 
-    for _ in range(horizon):
-        state_t, reward_logits_t, done_logits_t = world_model.encode_state(obs_ctx, act_ctx)
-        action_t, log_prob_t, value_t, _ = actor_critic.act(state_t)
-        next_frame, _, _ = world_model.imagine_next_frame(obs_ctx, act_ctx, action_t)
+    with autocast(device_type=device_type):
+        for _ in range(horizon):
+            state_t, reward_logits_t, done_logits_t = world_model.encode_state(obs_ctx, act_ctx)
+            action_t, log_prob_t, value_t, _ = actor_critic.act(state_t)
+            next_frame, _, _ = world_model.imagine_next_frame(obs_ctx, act_ctx, action_t)
 
-        states.append(state_t)
-        actions.append(action_t)
-        log_probs.append(log_prob_t)
-        values.append(value_t)
-        reward_logits_list.append(reward_logits_t)
-        done_logits_list.append(done_logits_t)
+            states.append(state_t.float())
+            actions.append(action_t)
+            log_probs.append(log_prob_t.float())
+            values.append(value_t.float())
+            reward_logits_list.append(reward_logits_t)
+            done_logits_list.append(done_logits_t)
 
-        obs_ctx = torch.cat([obs_ctx[:, 1:], next_frame.unsqueeze(1)], dim=1)
-        act_ctx = torch.cat([act_ctx[:, 1:], action_t.unsqueeze(1)], dim=1)
+            obs_ctx = torch.cat([obs_ctx[:, 1:], next_frame.unsqueeze(1)], dim=1)
+            act_ctx = torch.cat([act_ctx[:, 1:], action_t.unsqueeze(1)], dim=1)
 
-    # chamada extra: reward/done de action_{H-1} + bootstrap value de s_H
-    state_H, reward_logits_H, done_logits_H = world_model.encode_state(obs_ctx, act_ctx)
-    _, bootstrap_value = actor_critic.forward(state_H)
+        # chamada extra: reward/done de action_{H-1} + bootstrap value de s_H
+        state_H, reward_logits_H, done_logits_H = world_model.encode_state(obs_ctx, act_ctx)
+        _, bootstrap_value = actor_critic.forward(state_H)
+        bootstrap_value = bootstrap_value.float()
     reward_logits_list.append(reward_logits_H)
     done_logits_list.append(done_logits_H)
 

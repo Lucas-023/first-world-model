@@ -111,7 +111,9 @@ def ppo_update(actor_critic, optimizer, buffer, n_epochs, minibatch_size, clip_r
         for start in range(0, n, minibatch_size):
             idx = perm[start:start + minibatch_size]
             mask = active_mask[idx]
-            mask_sum = mask.sum().clamp(min=1.0)
+            mask_sum = mask.sum()
+            if mask_sum.item() == 0:
+                continue  # minibatch inteiro pos-done, sem passo ativo -- pular em vez de dar um step com gradiente zero
 
             new_log_probs, values, entropy = actor_critic.evaluate(states[idx], actions[idx])
 
@@ -268,12 +270,12 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_path", type=str, required=True, help="dataset_tokens -- so usado pra sementes de contexto real")
-    p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/gpt_best.pt")
+    p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/DYNAMICS_GPT/pesos/gpt_ckpt.pt")
     p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
     p.add_argument("--save_dir", type=str, default="models/policy")
     p.add_argument("--run_name", type=str, default="POLICY_DREAM")
     p.add_argument("--updates", type=int, default=5000)
-    p.add_argument("--horizon", type=int, default=16)
+    p.add_argument("--horizon", type=int, default=8, help="passos de imaginacao por rollout -- eval_rollout.py mostrou reward confiavel (acima do baseline de persistencia) so ate ~passo 10-11, consistente em 3 checkpoints diferentes")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--seed_stride", type=int, default=8, help="stride ao amostrar sementes reais (so precisa de diversidade, nao exaustividade)")
     p.add_argument("--num_workers", type=int, default=4)

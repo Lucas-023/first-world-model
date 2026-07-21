@@ -11,13 +11,15 @@ RESUME_CKPT="models/dynamics/gpt_ckpt.pt"
 RUN_NAME="DYNAMICS_GPT"
 HORIZON=25
 N_WINDOWS=500
+EVAL_BATCH_SIZE=500
 
 echo "==> Rodando avaliacao do World Model (eval_rollout.py)..."
 python -m models.dynamics.eval_rollout \
     --dataset_path "$DATASET_PATH" \
     --dynamics_ckpt "$DYNAMICS_CKPT" \
     --horizon "$HORIZON" \
-    --n_windows "$N_WINDOWS"
+    --n_windows "$N_WINDOWS" \
+    --eval_batch_size "$EVAL_BATCH_SIZE"
 
 echo "==> Avaliacao concluida. Retomando treino de $RESUME_CKPT..."
 python -m models.dynamics.traingpt \

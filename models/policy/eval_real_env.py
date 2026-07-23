@@ -12,6 +12,10 @@ Uso:
     python -m models.policy.eval_real_env --n_episodes 10
     python -m models.policy.eval_real_env --n_episodes 3 --deterministic
     python -m models.policy.eval_real_env --n_episodes 10 --random_policy   (baseline pro relatorio)
+    python -m models.policy.eval_real_env --n_episodes 10 --sb3_policy --sb3_ckpt models/best_model.zip
+        (baseline "PPO direto no ambiente real", agente_coleta/train.py, MESMA regra de
+        fim de episodio dos outros modos -- sem o wrapper EarlyTermination, que so serve
+        pro treino -- pra ser comparavel com a politica via imaginacao)
     python -m models.policy.eval_real_env --n_episodes 1 --render   (so com display local)
 """
 
@@ -21,6 +25,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import argparse
 import csv
 import datetime
+from collections import deque
 import numpy as np
 import torch
 import gymnasium as gym
@@ -82,6 +87,57 @@ def make_eval_env(frame_skip, img_size, crop_rows, render):
     env = FrameSkip(env, skip=frame_skip)
     env = CropBlackBar(env, crop_rows=crop_rows)
     env = ResizeObservation(env, shape=(img_size, img_size))
+    return env
+
+
+class NormalizeAndTranspose(gym.ObservationWrapper):
+    """Identica a agente_coleta/train.py -- (H,W,C) uint8 -> (C,H,W) float32 [0,1]."""
+    def __init__(self, env):
+        super().__init__(env)
+        h, w, c = self.observation_space.shape
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(c, h, w), dtype=np.float32)
+
+    def observation(self, obs):
+        return np.transpose(obs, (2, 0, 1)).astype(np.float32) / 255.0
+
+
+class FrameStackChannels(gym.Wrapper):
+    """Identica a agente_coleta/train.py -- empilha os ultimos n_stack frames no eixo
+    de canais. No reset, repete o primeiro frame pra preencher o buffer."""
+    def __init__(self, env, n_stack=4):
+        super().__init__(env)
+        self._n_stack = n_stack
+        c, h, w = self.observation_space.shape
+        self._frames = deque(maxlen=n_stack)
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(c * n_stack, h, w), dtype=np.float32)
+
+    def _get_obs(self):
+        return np.concatenate(list(self._frames), axis=0)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        for _ in range(self._n_stack):
+            self._frames.append(obs)
+        return self._get_obs(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._frames.append(obs)
+        return self._get_obs(), reward, terminated, truncated, info
+
+
+def make_sb3_env(frame_skip, img_size, crop_rows, n_stack, render):
+    """MESMO pipeline de observacao do agente_coleta/train.py, mas SEM o wrapper
+    EarlyTermination -- aquele wrapper trunca episodios ruins cedo e so faz sentido
+    durante o treino; aqui, pra comparar de forma justa com os outros baselines
+    deste script, o episodio so acaba por terminated real ou pelo TimeLimit padrao
+    do gym (max_episode_steps=1000), igual aos outros modos."""
+    env = gym.make("CarRacing-v3", continuous=False, render_mode="human" if render else None)
+    env = FrameSkip(env, skip=frame_skip)
+    env = CropBlackBar(env, crop_rows=crop_rows)
+    env = ResizeObservation(env, shape=(img_size, img_size))
+    env = NormalizeAndTranspose(env)
+    env = FrameStackChannels(env, n_stack=n_stack)
     return env
 
 
@@ -188,6 +244,30 @@ def run_episode_random(env, context_len, skip_frames, seed):
     return total_reward, steps
 
 
+def run_episode_sb3(env, model, context_len, skip_frames, deterministic, seed):
+    """Baseline: PPO treinado direto no ambiente real (agente_coleta/train.py),
+    observando pixels em vez de tokens. Usa o MESMO orcamento de warmup
+    (skip_frames + context_len) que run_episode_random/run_episode_policy, mesmo
+    o SB3 nao precisando de janela de contexto, so pra manter o numero de passos
+    reais decorridos antes de comecar a pontuar identico entre os 3 baselines."""
+    env.reset(seed=seed)
+    obs, ended = _warmup(env, skip_frames + context_len)
+    if ended:
+        return 0.0, 0
+
+    total_reward = 0.0
+    steps = 0
+    done = False
+    while not done:
+        action, _ = model.predict(obs, deterministic=deterministic)
+        obs, reward, terminated, truncated, _ = env.step(int(action))
+        done = terminated or truncated
+        total_reward += reward
+        steps += 1
+
+    return total_reward, steps
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--policy_ckpt", type=str, default="models/policy/policy_best.pt")
@@ -202,6 +282,10 @@ def main():
     p.add_argument("--deterministic", action="store_true", help="usa argmax da politica em vez de amostrar da categorica")
     p.add_argument("--random_policy", action="store_true",
                     help="baseline: ignora policy_ckpt e sorteia acao uniforme a cada passo -- para comparar no relatorio")
+    p.add_argument("--sb3_policy", action="store_true",
+                    help="baseline: usa o PPO treinado direto no real (agente_coleta/train.py) em vez da politica via imaginacao")
+    p.add_argument("--sb3_ckpt", type=str, default="models/best_model.zip", help="checkpoint .zip do stable-baselines3 (ver --sb3_policy)")
+    p.add_argument("--n_stack", type=int, default=4, help="frames empilhados no pipeline do sb3_policy, igual agente_coleta/train.py")
     p.add_argument("--render", action="store_true", help="so funciona com display local, nao numa VM headless")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -215,9 +299,28 @@ def main():
     # comparacao justa com a politica treinada (ver docstring de run_episode_random)
     world_model, wm_config = load_world_model(args.dynamics_ckpt, device)
 
-    env = make_eval_env(args.frame_skip, args.img_size, args.crop_rows, args.render)
+    if args.sb3_policy:
+        env = make_sb3_env(args.frame_skip, args.img_size, args.crop_rows, args.n_stack, args.render)
+    else:
+        env = make_eval_env(args.frame_skip, args.img_size, args.crop_rows, args.render)
 
-    if args.random_policy:
+    if args.sb3_policy:
+        from stable_baselines3 import PPO
+        model = PPO.load(args.sb3_ckpt, device=device)
+        print(f"PPO (agente_coleta) carregado de {args.sb3_ckpt}.")
+
+        print(f"\nRodando {args.n_episodes} episodios no CarRacing-v3 REAL com PPO direto "
+              f"({'deterministico' if args.deterministic else 'estocastico'})...\n")
+
+        rewards, steps_log = [], []
+        for ep in range(args.n_episodes):
+            reward, steps = run_episode_sb3(
+                env, model, wm_config.context_len, args.skip_frames, args.deterministic, seed=args.seed + ep,
+            )
+            rewards.append(reward)
+            steps_log.append(steps)
+            print(f"[Ep {ep:>3}] reward: {reward:>8.2f} | steps: {steps:>4}")
+    elif args.random_policy:
         print(f"\nRodando {args.n_episodes} episodios no CarRacing-v3 REAL com politica ALEATORIA (baseline)...\n")
         rewards, steps_log = [], []
         for ep in range(args.n_episodes):
@@ -269,11 +372,17 @@ def main():
     print(f"{'='*60}\n")
 
     if args.out_csv:
-        label = args.label or ("random" if args.random_policy else os.path.basename(args.policy_ckpt))
+        if args.sb3_policy:
+            default_label, ckpt_for_csv = "sb3_direto", args.sb3_ckpt
+        elif args.random_policy:
+            default_label, ckpt_for_csv = "random", ""
+        else:
+            default_label, ckpt_for_csv = os.path.basename(args.policy_ckpt), args.policy_ckpt
+        label = args.label or default_label
         append_csv_row(args.out_csv, {
             "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
             "label": label,
-            "policy_ckpt": "" if args.random_policy else args.policy_ckpt,
+            "policy_ckpt": ckpt_for_csv,
             "random_policy": args.random_policy,
             "deterministic": args.deterministic,
             "n_episodes": args.n_episodes,

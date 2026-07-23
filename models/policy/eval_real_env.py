@@ -19,6 +19,8 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
+import csv
+import datetime
 import numpy as np
 import torch
 import gymnasium as gym
@@ -60,6 +62,19 @@ class FrameSkip(gym.Wrapper):
             if terminated or truncated:
                 break
         return obs, total_reward, terminated, truncated, info
+
+
+def append_csv_row(path, row):
+    """Acrescenta 1 linha de resumo -- cria o arquivo com cabecalho se ainda
+    nao existir. Cada execucao do script gera 1 linha, nao 1 por episodio
+    (o detalhe por episodio ja fica no log de stdout)."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def make_eval_env(frame_skip, img_size, crop_rows, render):
@@ -190,6 +205,8 @@ def main():
     p.add_argument("--render", action="store_true", help="so funciona com display local, nao numa VM headless")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--out_csv", type=str, default=None, help="se definido, acrescenta 1 linha resumo desta execucao nesse CSV")
+    p.add_argument("--label", type=str, default=None, help="identificador da execucao no CSV (default: 'random' ou o nome do policy_ckpt)")
     args = p.parse_args()
 
     device = args.device
@@ -250,6 +267,23 @@ def main():
     print(f"  Reward max  : {rewards.max():.2f}  |  Min: {rewards.min():.2f}")
     print(f"  Steps medio : {np.mean(steps_log):.1f}")
     print(f"{'='*60}\n")
+
+    if args.out_csv:
+        label = args.label or ("random" if args.random_policy else os.path.basename(args.policy_ckpt))
+        append_csv_row(args.out_csv, {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "label": label,
+            "policy_ckpt": "" if args.random_policy else args.policy_ckpt,
+            "random_policy": args.random_policy,
+            "deterministic": args.deterministic,
+            "n_episodes": args.n_episodes,
+            "reward_mean": float(rewards.mean()),
+            "reward_std": float(rewards.std()),
+            "reward_max": float(rewards.max()),
+            "reward_min": float(rewards.min()),
+            "steps_mean": float(np.mean(steps_log)),
+        })
+        print(f"Resumo salvo em: {args.out_csv}")
 
 
 if __name__ == "__main__":

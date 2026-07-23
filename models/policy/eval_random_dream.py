@@ -25,11 +25,25 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
+import csv
+import datetime
 import math
 import torch
 
 from models.policy.train_dream import load_world_model, seed_iterator
 from models.policy.rollout import collect_rollout
+
+
+def append_csv_row(path, row):
+    """Acrescenta 1 linha de resumo -- cria o arquivo com cabecalho se ainda
+    nao existir."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 class RandomPolicy:
@@ -67,6 +81,8 @@ def main():
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=123)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--out_csv", type=str, default=None, help="se definido, acrescenta 1 linha resumo desta execucao nesse CSV")
+    p.add_argument("--label", type=str, default="aleatoria_sonhando", help="identificador da execucao no CSV")
     args = p.parse_args()
 
     device = args.device
@@ -99,6 +115,18 @@ def main():
     print(f"  Rollouts: {args.n_rollouts}  |  Sementes por rollout: {args.batch_size}")
     print(f"  Reward medio por passo imaginado: {rewards.mean():.4f}  |  Std: {rewards.std():.4f}")
     print(f"{'='*60}\n")
+
+    if args.out_csv:
+        append_csv_row(args.out_csv, {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "label": args.label,
+            "n_rollouts": args.n_rollouts,
+            "batch_size": args.batch_size,
+            "horizon": args.horizon,
+            "reward_mean_per_step": float(rewards.mean()),
+            "reward_std_per_step": float(rewards.std()),
+        })
+        print(f"Resumo salvo em: {args.out_csv}")
 
 
 if __name__ == "__main__":

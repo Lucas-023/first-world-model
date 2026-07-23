@@ -11,6 +11,7 @@ nao a classe {-1,0,+1} que o world model preve).
 Uso:
     python -m models.policy.eval_real_env --n_episodes 10
     python -m models.policy.eval_real_env --n_episodes 3 --deterministic
+    python -m models.policy.eval_real_env --n_episodes 10 --random_policy   (baseline pro relatorio)
     python -m models.policy.eval_real_env --n_episodes 1 --render   (so com display local)
 """
 
@@ -89,16 +90,26 @@ def load_world_model(ckpt_path, device):
     return model, config
 
 
+def _warmup(env, n_steps):
+    """Anda `n_steps` com acao 'nada' (0), sem pontuar. Usado tanto pra pular a
+    introducao (zoom-in) quanto, no caso da politica treinada, pra montar a
+    janela de contexto inicial."""
+    for _ in range(n_steps):
+        obs, _, terminated, truncated, _ = env.step(0)
+        if terminated or truncated:
+            return obs, True
+    return obs, False
+
+
 @torch.no_grad()
-def run_episode(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, deterministic, seed):
+def run_episode_policy(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, deterministic, seed):
     obs, _ = env.reset(seed=seed)
 
     # pula a introducao (zoom-in) do CarRacing -- mesmo skip_frames do extract_tokens.py,
     # usado no dataset real que treinou o world model
-    for _ in range(skip_frames):
-        obs, _, terminated, truncated, _ = env.step(0)
-        if terminated or truncated:
-            return 0.0, 0
+    obs, ended = _warmup(env, skip_frames)
+    if ended:
+        return 0.0, 0
 
     # monta a janela de contexto inicial andando com acao "nada" (0), gerando
     # historico sequencial real em vez de duplicar um unico frame
@@ -138,6 +149,30 @@ def run_episode(env, world_model, vqvae, actor_critic, context_len, device, skip
     return total_reward, steps
 
 
+def run_episode_random(env, context_len, skip_frames, seed):
+    """Baseline: acao uniforme aleatoria a cada passo. Usa o mesmo orcamento
+    de warmup nao-pontuado (skip_frames + context_len) que a politica
+    treinada gasta montando sua janela de contexto, pra ser uma comparacao
+    justa (mesmo numero de passos reais decorridos ate comecar a pontuar)."""
+    env.reset(seed=seed)
+    _, ended = _warmup(env, skip_frames + context_len)
+    if ended:
+        return 0.0, 0
+
+    n_actions = env.action_space.n
+    total_reward = 0.0
+    steps = 0
+    done = False
+    while not done:
+        a = np.random.randint(n_actions)
+        _, reward, terminated, truncated, _ = env.step(a)
+        done = terminated or truncated
+        total_reward += reward
+        steps += 1
+
+    return total_reward, steps
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--policy_ckpt", type=str, default="models/policy/policy_best.pt")
@@ -150,6 +185,8 @@ def main():
     p.add_argument("--skip_frames", type=int, default=12, help="frames de introducao (zoom) ignorados, igual extract_tokens.py")
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--deterministic", action="store_true", help="usa argmax da politica em vez de amostrar da categorica")
+    p.add_argument("--random_policy", action="store_true",
+                    help="baseline: ignora policy_ckpt e sorteia acao uniforme a cada passo -- para comparar no relatorio")
     p.add_argument("--render", action="store_true", help="so funciona com display local, nao numa VM headless")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -157,41 +194,53 @@ def main():
 
     device = args.device
 
+    # so pra saber context_len -- mesmo orcamento de warmup do baseline aleatorio,
+    # comparacao justa com a politica treinada (ver docstring de run_episode_random)
     world_model, wm_config = load_world_model(args.dynamics_ckpt, device)
-    print(f"World model carregado (context_len={wm_config.context_len}, congelado).")
-
-    vqvae = VQVAE(in_channels=3, latent_dim=256, num_embeddings=wm_config.obs_vocab_size).to(device)
-    vqvae.load_state_dict(torch.load(args.vqvae_path, map_location=device, weights_only=True)["model_state_dict"])
-    vqvae.eval()
-    for p_ in vqvae.parameters():
-        p_.requires_grad_(False)
-    print("VQ-VAE carregado.")
-
-    actor_critic = ActorCritic(
-        state_dim=wm_config.n_embd, n_actions=wm_config.act_vocab_size, hidden_dim=args.hidden_dim
-    ).to(device)
-    ckpt = torch.load(args.policy_ckpt, map_location=device, weights_only=True)
-    actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
-    actor_critic.eval()
-    print(
-        f"Politica carregada de {args.policy_ckpt} "
-        f"(update {ckpt.get('update', '?')}, best_reward imaginado {ckpt.get('best_reward', float('nan')):.4f})"
-    )
 
     env = make_eval_env(args.frame_skip, args.img_size, args.crop_rows, args.render)
 
-    print(f"\nRodando {args.n_episodes} episodios no CarRacing-v3 REAL "
-          f"({'deterministico (argmax)' if args.deterministic else 'estocastico (sample)'})...\n")
+    if args.random_policy:
+        print(f"\nRodando {args.n_episodes} episodios no CarRacing-v3 REAL com politica ALEATORIA (baseline)...\n")
+        rewards, steps_log = [], []
+        for ep in range(args.n_episodes):
+            reward, steps = run_episode_random(env, wm_config.context_len, args.skip_frames, seed=args.seed + ep)
+            rewards.append(reward)
+            steps_log.append(steps)
+            print(f"[Ep {ep:>3}] reward: {reward:>8.2f} | steps: {steps:>4}")
+    else:
+        print("World model carregado (congelado).")
 
-    rewards, steps_log = [], []
-    for ep in range(args.n_episodes):
-        reward, steps = run_episode(
-            env, world_model, vqvae, actor_critic, wm_config.context_len, device,
-            args.skip_frames, args.deterministic, seed=args.seed + ep,
+        vqvae = VQVAE(in_channels=3, latent_dim=256, num_embeddings=wm_config.obs_vocab_size).to(device)
+        vqvae.load_state_dict(torch.load(args.vqvae_path, map_location=device, weights_only=True)["model_state_dict"])
+        vqvae.eval()
+        for p_ in vqvae.parameters():
+            p_.requires_grad_(False)
+        print("VQ-VAE carregado.")
+
+        actor_critic = ActorCritic(
+            state_dim=wm_config.n_embd, n_actions=wm_config.act_vocab_size, hidden_dim=args.hidden_dim
+        ).to(device)
+        ckpt = torch.load(args.policy_ckpt, map_location=device, weights_only=True)
+        actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
+        actor_critic.eval()
+        print(
+            f"Politica carregada de {args.policy_ckpt} "
+            f"(update {ckpt.get('update', '?')}, best_reward imaginado {ckpt.get('best_reward', float('nan')):.4f})"
         )
-        rewards.append(reward)
-        steps_log.append(steps)
-        print(f"[Ep {ep:>3}] reward: {reward:>8.2f} | steps: {steps:>4}")
+
+        print(f"\nRodando {args.n_episodes} episodios no CarRacing-v3 REAL "
+              f"({'deterministico (argmax)' if args.deterministic else 'estocastico (sample)'})...\n")
+
+        rewards, steps_log = [], []
+        for ep in range(args.n_episodes):
+            reward, steps = run_episode_policy(
+                env, world_model, vqvae, actor_critic, wm_config.context_len, device,
+                args.skip_frames, args.deterministic, seed=args.seed + ep,
+            )
+            rewards.append(reward)
+            steps_log.append(steps)
+            print(f"[Ep {ep:>3}] reward: {reward:>8.2f} | steps: {steps:>4}")
 
     env.close()
 

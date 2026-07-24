@@ -27,7 +27,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +251,19 @@ def train(args):
     )
     vec_env = make_vec_env(env_fn, n_envs=args.n_envs, seed=args.seed)
 
+    # normaliza so o reward (nao a observacao, que ja esta em [0,1] via
+    # NormalizeAndTranspose) -- reward do CarRacing e espinhoso (-0.1 por
+    # frame + picos de +tile), o que faz o alvo do value function variar
+    # muito de escala; nao afeta a policy net (que nunca ve o reward) nem a
+    # avaliacao (eval_env abaixo fica sem VecNormalize, reward cru)
+    vecnorm_path = os.path.join(args.model_dir, "vecnormalize.pkl")
+    if args.norm_reward:
+        if resume_path and os.path.exists(vecnorm_path):
+            vec_env = VecNormalize.load(vecnorm_path, vec_env)
+            print(f"Estatisticas de VecNormalize retomadas de: {vecnorm_path}")
+        else:
+            vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=0.99)
+
     eval_fn = make_env(
         frame_skip=args.frame_skip, img_size=args.img_size,
         crop_rows=args.crop_rows, n_stack=args.frame_stack,
@@ -291,7 +304,7 @@ def train(args):
             custom_objects={
                 "learning_rate": lr_fn,
                 "clip_range":    0.2,
-                "n_steps":       512,
+                "n_steps":       args.n_steps,
                 "batch_size":    512,
                 "policy_kwargs": policy_kwargs,
             },
@@ -302,7 +315,7 @@ def train(args):
             policy          = "CnnPolicy",
             env             = vec_env,
             learning_rate   = lr_fn,
-            n_steps         = 128,
+            n_steps         = args.n_steps,
             batch_size      = 512,
             n_epochs        = 10,
             gamma           = 0.99,
@@ -355,6 +368,10 @@ def train(args):
     model.save(final_path)
     print(f"\nModelo final salvo em: {final_path}.zip")
 
+    if isinstance(vec_env, VecNormalize):
+        vec_env.save(vecnorm_path)
+        print(f"Estatisticas de VecNormalize salvas em: {vecnorm_path}")
+
     vec_env.close()
     eval_env.close()
     return model
@@ -398,6 +415,8 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--timesteps",       type=int,  default=2_000_000)
     p.add_argument("--n_envs",          type=int,  default=24)
+    p.add_argument("--n_steps",         type=int,  default=512, help="passos coletados por env antes de cada update PPO (era 128 no treino do zero e 512 no resume -- inconsistente; unificado aqui)")
+    p.add_argument("--norm_reward",     action=argparse.BooleanOptionalAction, default=True, help="normaliza o reward do vec_env de treino (running mean/std) -- reward do CarRacing e espinhoso, ajuda o value function; nao afeta eval_env nem model.predict()")
     p.add_argument("--resume",          action="store_true")
     p.add_argument("--resume_path",     type=str,  default=None)
     p.add_argument("--frame_skip",      type=int,  default=4)

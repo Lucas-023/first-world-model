@@ -27,7 +27,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback, BaseCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +249,14 @@ def train(args):
         crop_rows=args.crop_rows, n_stack=args.frame_stack,
         early_termination=True,
     )
-    vec_env = make_vec_env(env_fn, n_envs=args.n_envs, seed=args.seed)
+    # DummyVecEnv roda os n_envs SEQUENCIALMENTE numa unica thread (nao ha
+    # paralelismo real de CPU nenhum); SubprocVecEnv poe cada env num
+    # processo separado, usando nucleos de verdade -- muda so a velocidade
+    # de execucao, nao a fisica/reward/estatistica coletada. No Windows
+    # precisa do guard "if __name__ == '__main__'" (ja existe no fim deste
+    # arquivo) pro multiprocessing (spawn) funcionar.
+    vec_env_cls = DummyVecEnv if args.dummy_vecenv else SubprocVecEnv
+    vec_env = make_vec_env(env_fn, n_envs=args.n_envs, seed=args.seed, vec_env_cls=vec_env_cls)
 
     # normaliza so o reward (nao a observacao, que ja esta em [0,1] via
     # NormalizeAndTranspose) -- reward do CarRacing e espinhoso (-0.1 por
@@ -430,6 +437,7 @@ def parse_args():
     p.add_argument("--n_envs",          type=int,  default=24)
     p.add_argument("--n_steps",         type=int,  default=512, help="passos coletados por env antes de cada update PPO (era 128 no treino do zero e 512 no resume -- inconsistente; unificado aqui)")
     p.add_argument("--norm_reward",     action=argparse.BooleanOptionalAction, default=True, help="normaliza o reward do vec_env de treino (running mean/std) -- reward do CarRacing e espinhoso, ajuda o value function; nao afeta eval_env nem model.predict()")
+    p.add_argument("--dummy_vecenv",    action="store_true", help="usa DummyVecEnv (sequencial, 1 thread) em vez de SubprocVecEnv (default agora) -- fallback se der problema de multiprocessing")
     p.add_argument("--resume",          action="store_true")
     p.add_argument("--resume_path",     type=str,  default=None)
     p.add_argument("--frame_skip",      type=int,  default=4)

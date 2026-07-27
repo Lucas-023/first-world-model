@@ -153,6 +153,29 @@ class WorldModel(nn.Module):
         state_repr = x[:, -1, -1, :]
         return state_repr, self.head_rewards(state_repr), self.head_dones(state_repr)
 
+    @torch.no_grad()
+    def encode_state_and_frame(self, obs_tokens, act_tokens):
+        """
+        Como encode_state, mas tambem retorna frame_repr (B,n_embd): a media
+        das 64 posicoes de token visual do ULTIMO frame do contexto (antes da
+        posicao de acao), pooled num vetor so. Existe pra aproximar o desenho
+        do controlador do paper original (Ha & Schmidhuber 2018): la, C recebe
+        z_t (latente da VAE do frame atual) CONCATENADO com h_t (estado oculto
+        da RNN, usado pra prever o proximo z) -- aqui, state_repr faz o papel
+        de h_t (ja e o mesmo vetor usado pra prever reward/done/proximo frame)
+        e frame_repr aproxima z_t (representacao do frame atual). Ressalva:
+        frame_repr passa pela mascara causal, entao carrega alguma mistura do
+        contexto anterior tambem -- nao e um z "puro" isolado do frame, so uma
+        aproximacao pratica reaproveitando o forward que ja existe.
+        """
+        B, T, K = obs_tokens.shape
+        x = self._transform(obs_tokens, act_tokens).view(
+            B, T, self.config.tokens_per_block, self.config.n_embd
+        )
+        state_repr = x[:, -1, -1, :]
+        frame_repr = x[:, -1, :-1, :].mean(dim=1)
+        return state_repr, frame_repr, self.head_rewards(state_repr), self.head_dones(state_repr)
+
     def _project_kv(self, layer, normed_x):
         """Projeta K,V de uma camada a partir do input ja normalizado (norm_first=True e
         o mesmo input que layer.self_attn recebe internamente) -- usa os MESMOS pesos

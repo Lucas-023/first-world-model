@@ -254,15 +254,8 @@ def train(args):
     # normaliza so o reward (nao a observacao, que ja esta em [0,1] via
     # NormalizeAndTranspose) -- reward do CarRacing e espinhoso (-0.1 por
     # frame + picos de +tile), o que faz o alvo do value function variar
-    # muito de escala; nao afeta a policy net (que nunca ve o reward) nem a
-    # avaliacao (eval_env abaixo fica sem VecNormalize, reward cru)
+    # muito de escala; nao afeta a policy net (que nunca ve o reward)
     vecnorm_path = os.path.join(args.model_dir, "vecnormalize.pkl")
-    if args.norm_reward:
-        if resume_path and os.path.exists(vecnorm_path):
-            vec_env = VecNormalize.load(vecnorm_path, vec_env)
-            print(f"Estatisticas de VecNormalize retomadas de: {vecnorm_path}")
-        else:
-            vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=0.99)
 
     eval_fn = make_env(
         frame_skip=args.frame_skip, img_size=args.img_size,
@@ -270,6 +263,20 @@ def train(args):
         early_termination=False,
     )
     eval_env = make_vec_env(eval_fn, n_envs=1, seed=args.seed + 999)
+
+    if args.norm_reward:
+        if resume_path and os.path.exists(vecnorm_path):
+            vec_env = VecNormalize.load(vecnorm_path, vec_env)
+            print(f"Estatisticas de VecNormalize retomadas de: {vecnorm_path}")
+        else:
+            vec_env = VecNormalize(vec_env, norm_obs=False, norm_reward=True, clip_reward=10.0, gamma=0.99)
+        # EvalCallback (dentro do SB3) sincroniza as estatisticas de
+        # normalizacao entre treino e eval a cada avaliacao, e exige que os
+        # dois envs sejam do MESMO tipo de wrapper (VecNormalize) -- por isso
+        # o eval_env tambem precisa ser embrulhado, mas com norm_reward=False
+        # e training=False, pra reportar reward CRU (nao normalizado) e nunca
+        # atualizar suas proprias estatisticas com dados de avaliacao.
+        eval_env = VecNormalize(eval_env, norm_obs=False, norm_reward=False, training=False, gamma=0.99)
 
     # -- Learning rate --------------------------------------------------------
     # -- Learning rate --------------------------------------------------------
@@ -332,8 +339,14 @@ def train(args):
         )
 
     # -- Callbacks ------------------------------------------------------------
-    ckpt_freq = max(args.timesteps // 20, 10_000)
-    eval_freq = max(args.timesteps // 40,  5_000)
+    # CheckpointCallback/EvalCallback contam save_freq/eval_freq em CHAMADAS
+    # de callback, nao em timesteps reais -- 1 chamada = n_envs timesteps
+    # (uma rodada de coleta em todos os envs paralelos). Sem dividir por
+    # n_envs, um ckpt_freq "de 100_000 timesteps" so dispara de fato a cada
+    # 100_000 * n_envs timesteps reais -- com n_envs=24 e 2M de budget,
+    # isso passava do total e NUNCA disparava.
+    ckpt_freq = max(max(args.timesteps // 20, 10_000) // args.n_envs, 1)
+    eval_freq = max(max(args.timesteps // 40,  5_000) // args.n_envs, 1)
 
     callbacks = [
         ProgressCallback(print_freq=50),

@@ -173,7 +173,7 @@ def _warmup(env, n_steps):
 
 
 @torch.no_grad()
-def run_episode_policy(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, deterministic, seed):
+def run_episode_policy(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, deterministic, seed, use_zh=False):
     obs, _ = env.reset(seed=seed)
 
     # pula a introducao (zoom-in) do CarRacing -- mesmo skip_frames do extract_tokens.py,
@@ -200,7 +200,11 @@ def run_episode_policy(env, world_model, vqvae, actor_critic, context_len, devic
     steps = 0
     done = False
     while not done:
-        state, _, _ = world_model.encode_state(obs_ctx, act_ctx)
+        if use_zh:
+            h, z, _, _ = world_model.encode_state_and_frame(obs_ctx, act_ctx)
+            state = torch.cat([h, z], dim=-1)
+        else:
+            state, _, _ = world_model.encode_state(obs_ctx, act_ctx)
         if deterministic:
             logits, _ = actor_critic.forward(state)
             action = logits.argmax(dim=-1)
@@ -285,6 +289,7 @@ def main():
     p.add_argument("--sb3_policy", action="store_true",
                     help="baseline: usa o PPO treinado direto no real (agente_coleta/train.py) em vez da politica via imaginacao")
     p.add_argument("--sb3_ckpt", type=str, default="models/best_model.zip", help="checkpoint .zip do stable-baselines3 (ver --sb3_policy)")
+    p.add_argument("--zh", action="store_true", help="politica treinada com models/policy/train_real_latent_zh.py -- entrada e [state_repr, frame_repr] (512-d) em vez de so state_repr (256-d)")
     p.add_argument("--n_stack", type=int, default=4, help="frames empilhados no pipeline do sb3_policy, igual agente_coleta/train.py")
     p.add_argument("--render", action="store_true", help="so funciona com display local, nao numa VM headless")
     p.add_argument("--seed", type=int, default=0)
@@ -338,8 +343,9 @@ def main():
             p_.requires_grad_(False)
         print("VQ-VAE carregado.")
 
+        state_dim = wm_config.n_embd * 2 if args.zh else wm_config.n_embd
         actor_critic = ActorCritic(
-            state_dim=wm_config.n_embd, n_actions=wm_config.act_vocab_size, hidden_dim=args.hidden_dim
+            state_dim=state_dim, n_actions=wm_config.act_vocab_size, hidden_dim=args.hidden_dim
         ).to(device)
         ckpt = torch.load(args.policy_ckpt, map_location=device, weights_only=True)
         actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
@@ -356,7 +362,7 @@ def main():
         for ep in range(args.n_episodes):
             reward, steps = run_episode_policy(
                 env, world_model, vqvae, actor_critic, wm_config.context_len, device,
-                args.skip_frames, args.deterministic, seed=args.seed + ep,
+                args.skip_frames, args.deterministic, seed=args.seed + ep, use_zh=args.zh,
             )
             rewards.append(reward)
             steps_log.append(steps)

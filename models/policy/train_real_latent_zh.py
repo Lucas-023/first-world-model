@@ -26,9 +26,14 @@ import torch
 
 from models.policy.modules import ActorCritic
 from models.policy.train_dream import load_world_model, ppo_update
-from models.policy.eval_real_env import make_eval_env, frame_to_tensor, _warmup
+from models.policy.eval_real_env import make_eval_env, frame_to_tensor, _warmup, run_episode_policy
 from models.encoder.modules import VQVAE
 from models.encoder.board import Board
+
+# seeds do mini-eval periodico -- bem acima de qualquer seed que collect_batch
+# possa gerar (seed_base = args.seed + update*episodes_per_update), pra nunca
+# reutilizar uma pista ja vista no treino
+EVAL_SEED_BASE = 10_000_000
 
 
 @torch.no_grad()
@@ -186,15 +191,15 @@ def train(args):
     print(f"TensorBoard: tensorboard --logdir runs/{args.run_name}")
 
     start_update = 0
-    best_reward = float("-inf")
+    best_eval_reward = float("-inf")
     if os.path.exists(ckpt_path):
         print(f"Retomando de: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_update = ckpt["update"] + 1
-        best_reward = ckpt.get("best_reward", float("-inf"))
-        print(f"Continuando do update {start_update} | melhor reward real medio: {best_reward:.4f}")
+        best_eval_reward = ckpt.get("best_eval_reward", float("-inf"))
+        print(f"Continuando do update {start_update} | melhor reward de eval: {best_eval_reward:.4f}")
     else:
         print("Iniciando do zero.")
 
@@ -227,20 +232,47 @@ def train(args):
         board.log_scalar("train/mean_episode_reward", mean_ep_reward, update)
         board.log_scalar("train/mean_episode_length", mean_ep_len, update)
 
-        if mean_ep_reward > best_reward:
-            best_reward = mean_ep_reward
+        # mean_ep_reward acima e a media de so --episodes_per_update episodios,
+        # com as MESMAS seeds do update de treino -- ruidoso demais e tendencioso
+        # pra decidir o "melhor" checkpoint (visto na pratica em train_real_latent.py:
+        # um treino de 2290 updates com policy_best.pt escolhido assim colapsou sem
+        # que o metric de treino avisasse). Em vez disso, a cada eval_every updates
+        # roda um mini-eval deterministico com seeds fixas nunca vistas no treino.
+        if update % args.eval_every == 0 or update == args.updates - 1:
+            eval_rewards = []
+            for i in range(args.eval_episodes):
+                r, _ = run_episode_policy(
+                    env, world_model, vqvae, actor_critic, wm_config.context_len, device,
+                    args.skip_frames, deterministic=True, seed=EVAL_SEED_BASE + i, use_zh=True,
+                )
+                eval_rewards.append(r)
+            eval_reward = sum(eval_rewards) / len(eval_rewards)
+            print(f"  [Eval seeds fixas] reward_medio {eval_reward:.2f} ({args.eval_episodes} episodios)")
+            board.log_scalar("eval/mean_reward", eval_reward, update)
+
+            if eval_reward > best_eval_reward:
+                best_eval_reward = eval_reward
+                torch.save(
+                    {"update": update, "actor_critic_state_dict": actor_critic.state_dict(), "best_eval_reward": best_eval_reward},
+                    best_path,
+                )
+                print(f"  -> Novo melhor checkpoint (eval determinístico: {best_eval_reward:.2f})")
+
+        # snapshot periodico, nunca sobrescrito -- ponto de recuperacao caso o
+        # treino desestabilize mais adiante (best_path so atualiza em novo recorde,
+        # entao sozinho nao bastava pra recuperar um "meio termo" razoavel)
+        if args.ckpt_every > 0 and update % args.ckpt_every == 0:
             torch.save(
-                {"update": update, "actor_critic_state_dict": actor_critic.state_dict(), "best_reward": best_reward},
-                best_path,
+                {"update": update, "actor_critic_state_dict": actor_critic.state_dict(), "best_eval_reward": best_eval_reward},
+                os.path.join(args.save_dir, f"policy_update{update}.pt"),
             )
-            print(f"  -> Novo melhor reward real medio ({best_reward:.2f})")
 
         torch.save(
             {
                 "update": update,
                 "actor_critic_state_dict": actor_critic.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "best_reward": best_reward,
+                "best_eval_reward": best_eval_reward,
             },
             ckpt_path,
         )
@@ -273,6 +305,9 @@ if __name__ == "__main__":
     p.add_argument("--n_epochs", type=int, default=10)
     p.add_argument("--minibatch_size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval_every", type=int, default=50, help="a cada N updates, roda um mini-eval deterministico com seeds fixas (nunca vistas no treino) pra decidir o checkpoint 'melhor' -- mais confiavel que a media ruidosa de --episodes_per_update episodios de treino")
+    p.add_argument("--eval_episodes", type=int, default=10, help="episodios do mini-eval periodico")
+    p.add_argument("--ckpt_every", type=int, default=100, help="salva um snapshot separado (nao sobrescrito, policy_update{N}.pt) a cada N updates -- ponto de recuperacao caso o treino desestabilize mais adiante")
     p.add_argument("--benchmark_only", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()

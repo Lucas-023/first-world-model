@@ -11,6 +11,7 @@ Cada janela devolve:
 
 import os
 import glob
+import hashlib
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -37,19 +38,31 @@ class CarRacingTokenDataset(Dataset):
         self.chunks = []
 
         files = sorted(glob.glob(os.path.join(folder, "*.npz")))
-        rng = np.random.default_rng(seed)
-        files = [files[i] for i in rng.permutation(len(files))]
 
-        n = len(files)
-        n_train = int(n * train_ratio)
-        n_val = int(n * val_ratio)
+        # bucket por hash do NOME do arquivo (nao por indice/contagem) -- assim
+        # a divisao de um episodio ja existente nunca muda quando novos
+        # episodios sao adicionados na pasta depois (ex.: coleta com uma
+        # politica treinada, pra fine-tunar o World Model). Com o esquema
+        # antigo (rng.permutation(len(files))) o split inteiro era
+        # recalculado toda vez que o numero de arquivos mudava, entao um
+        # episodio podia migrar de test/val pra train (ou vice-versa) entre
+        # duas rodadas de traingpt.py -- inutilizava best_val_loss como
+        # medida de "melhorou de verdade" ao comparar checkpoints.
+        def bucket(fname):
+            h = hashlib.md5(f"{seed}:{os.path.basename(fname)}".encode()).hexdigest()
+            return int(h[:8], 16) / 0xFFFFFFFF  # em [0, 1), estavel por nome+seed
+
+        n_train_frac = train_ratio
+        n_val_frac = train_ratio + val_ratio
 
         if split == "train":
-            selected = files[:n_train]
+            selected = [f for f in files if bucket(f) < n_train_frac]
         elif split == "val":
-            selected = files[n_train:n_train + n_val]
+            selected = [f for f in files if n_train_frac <= bucket(f) < n_val_frac]
         else:
-            selected = files[n_train + n_val:]
+            selected = [f for f in files if bucket(f) >= n_val_frac]
+
+        n = len(files)
 
         print(f"[{split:>5}] {len(selected)}/{n} episodios")
 

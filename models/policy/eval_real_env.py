@@ -276,7 +276,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--policy_ckpt", type=str, default="models/policy/policy_best.pt")
     p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/DYNAMICS_GPT/pesos/gpt_ckpt.pt")
-    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
+    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt_best.pt", help="tem que ser o MESMO checkpoint que extract_tokens.py usou pra gerar dataset_tokens/ (default ckpt_best.pt) -- ckpt.pt e um checkpoint DIFERENTE, com um codebook diferente; usar o errado aqui tokeniza os frames reais num vocabulario que o World Model nunca viu")
     p.add_argument("--n_episodes", type=int, default=10)
     p.add_argument("--frame_skip", type=int, default=4)
     p.add_argument("--img_size", type=int, default=64)

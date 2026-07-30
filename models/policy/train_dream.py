@@ -271,7 +271,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dataset_path", type=str, required=True, help="dataset_tokens -- so usado pra sementes de contexto real")
     p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/DYNAMICS_GPT/pesos/gpt_ckpt.pt")
-    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
+    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt_best.pt", help="so usado pra decodificar os sonhos em imagem no TensorBoard -- usar o checkpoint diferente do que extract_tokens.py usou (ckpt.pt em vez de ckpt_best.pt) so deixa a visualizacao com aparencia errada, nao afeta o treino (os tokens de treino ja vem prontos de dataset_tokens/)")
     p.add_argument("--save_dir", type=str, default="models/policy")
     p.add_argument("--run_name", type=str, default="POLICY_DREAM")
     p.add_argument("--updates", type=int, default=5000)

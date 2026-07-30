@@ -308,7 +308,7 @@ def train(args):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/DYNAMICS_GPT/pesos/gpt_ckpt.pt")
-    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
+    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt_best.pt", help="tem que ser o MESMO checkpoint que extract_tokens.py usou pra gerar dataset_tokens/ (default ckpt_best.pt) -- ckpt.pt e um checkpoint DIFERENTE, com um codebook diferente; usar o errado aqui tokeniza os frames reais num vocabulario que o World Model nunca viu")
     p.add_argument("--save_dir", type=str, default="models/policy_real_latent")
     p.add_argument("--run_name", type=str, default="POLICY_REAL_LATENT")
     p.add_argument("--updates", type=int, default=500, help="interacao real e sequencial (1 env) -- bem mais lento em wall-clock que train_dream.py; comece pequeno e calibre com --benchmark_only")

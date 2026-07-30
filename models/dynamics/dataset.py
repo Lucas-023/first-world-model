@@ -17,6 +17,14 @@ import torch
 from torch.utils.data import Dataset
 
 
+def reward_to_class(rewards):
+    """Reward continuo -> classe {0,1,2} = {neg,neutro,pos}. Unica fonte de
+    verdade dessa conversao -- reaproveitada por models/policy/online_buffer.py
+    pra garantir que o replay buffer online rotule reward exatamente como o
+    dataset offline sempre rotulou."""
+    return (np.sign(rewards) + 1).astype(np.int64)
+
+
 class CarRacingTokenDataset(Dataset):
     SPLITS = ("train", "val", "test")
 
@@ -72,7 +80,7 @@ class CarRacingTokenDataset(Dataset):
             actions = d["actions"].astype(np.int64)      # (T,)
             dones = d["dones"].astype(np.int64)          # (T,)
             rewards = d["rewards"].astype(np.float32)    # (T,)
-            rewards_sign = (np.sign(rewards) + 1).astype(np.int64)  # {0,1,2}
+            rewards_sign = reward_to_class(rewards)      # {0,1,2}
 
             T = tokens.shape[0]
             if T < context_len + 1:

@@ -277,7 +277,7 @@ if __name__ == "__main__":
     p.add_argument("--save_dir", type=str, default="models/dynamics")
     p.add_argument("--run_name", type=str, default="DYNAMICS_GPT")
     p.add_argument("--resume_ckpt", type=str, default=None, help="caminho pro checkpoint pra retomar treino; se omitido, comeca do zero")
-    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
+    p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt_best.pt", help="so usado pra decodificar os sonhos em imagem no TensorBoard -- nao afeta o treino (os tokens ja vem prontos de dataset_tokens/)")
     p.add_argument("--epochs", type=int, default=5000)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)

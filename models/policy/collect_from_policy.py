@@ -49,84 +49,139 @@ from models.policy.eval_real_env import make_eval_env, frame_to_tensor, _warmup,
 from models.encoder.modules import VQVAE
 
 
-@torch.no_grad()
-def collect_episode_for_dataset(env, world_model, vqvae, actor_critic, context_len, device,
-                                 skip_frames, epsilon, deterministic, seed, use_zh, n_actions):
-    """Roda 1 episodio completo e devolve os 4 arrays no formato
-    dataset_tokens (tokens/actions/rewards/dones, alinhados como
-    agente_coleta/coleta.py grava). Devolve None se o episodio terminou
-    durante o warmup (zoom-in ou montagem da janela de contexto) -- raro,
-    descartado sem contar pro total (CarRacingTokenDataset tambem ignora
-    episodios com T < context_len+1, entao um episodio assim nao renderia
-    nenhuma janela de treino de qualquer forma)."""
-    obs, _ = env.reset(seed=seed)
-    obs, ended = _warmup(env, skip_frames)
-    if ended:
-        return None
+class RealEpisodeStepper:
+    """Anda 1 passo real de cada vez, mantendo em paralelo (a) a janela
+    deslizante (obs_ctx/act_ctx) usada pra ESCOLHER a acao via World
+    Model/ActorCritic -- pareamento "quadro que chegou / acao que causou",
+    igual train_real_latent.py::collect_episode -- e (b) os buffers
+    achatados (tokens/actions/rewards/dones) no formato dataset_tokens, na
+    convencao de indice de agente_coleta/coleta.py (actions[t] e a acao
+    ESCOLHIDA a partir de tokens[t], nao a que produziu tokens[t]). Os dois
+    pareamentos sao diferentes de proposito -- nao confundir um com o outro
+    (ver docstring do modulo).
 
-    tok_buf, act_buf, rew_buf, done_buf = [], [], [], []
+    Usado tanto por collect_episode_for_dataset (chama .step() em loop ate
+    o episodio acabar) quanto por train_online.py (chama .step() um passo
+    de cada vez, intercalado com ciclos de treino do World Model/politica)."""
 
-    # monta a janela de contexto inicial andando com acao "nada" (0) -- SAO
-    # passos reais, entao entram no buffer de arquivo tambem (nao sao so
-    # descartados como em train_real_latent.py::collect_episode, que so
-    # precisa da janela pronta pra comecar o PPO).
-    obs_ctx_list, act_ctx_list = [], []
-    for _ in range(context_len):
-        tok = vqvae.encode_indices(frame_to_tensor(obs, device)).view(1, -1)
-        obs_ctx_list.append(tok)
-        act_ctx_list.append(torch.zeros(1, dtype=torch.long, device=device))
+    def __init__(self, env, world_model, vqvae, actor_critic, context_len, device,
+                 skip_frames, epsilon, deterministic, use_zh, n_actions):
+        self.env = env
+        self.world_model = world_model
+        self.vqvae = vqvae
+        self.actor_critic = actor_critic
+        self.context_len = context_len
+        self.device = device
+        self.skip_frames = skip_frames
+        self.epsilon = epsilon
+        self.deterministic = deterministic
+        self.use_zh = use_zh
+        self.n_actions = n_actions
 
-        tok_np = tok.view(-1).cpu().numpy().astype(np.uint16)
-        next_obs, reward, terminated, truncated, _ = env.step(0)
+        self.obs_ctx = None
+        self.act_ctx = None
+        self.tok_buf = self.act_buf = self.rew_buf = self.done_buf = None
 
-        tok_buf.append(tok_np)
-        act_buf.append(0)
-        rew_buf.append(float(reward))
-        done_buf.append(bool(terminated or truncated))
+    @torch.no_grad()
+    def reset(self, seed):
+        """Pula os frames de introducao (zoom-in) e monta a janela de
+        contexto inicial (context_len passos com acao 'nada'=0) -- SAO
+        passos reais, entao entram no buffer de arquivo tambem (nao sao so
+        descartados como em train_real_latent.py::collect_episode, que so
+        precisa da janela pronta pra comecar o PPO). Devolve False se o
+        episodio terminou durante esse warmup (raro, mas possivel)."""
+        obs, _ = self.env.reset(seed=seed)
+        obs, ended = _warmup(self.env, self.skip_frames)
+        if ended:
+            return False
 
-        obs = next_obs
-        if terminated or truncated:
-            return None
+        self.tok_buf, self.act_buf, self.rew_buf, self.done_buf = [], [], [], []
+        obs_ctx_list, act_ctx_list = [], []
+        for _ in range(self.context_len):
+            tok = self.vqvae.encode_indices(frame_to_tensor(obs, self.device)).view(1, -1)
+            obs_ctx_list.append(tok)
+            act_ctx_list.append(torch.zeros(1, dtype=torch.long, device=self.device))
 
-    obs_ctx = torch.stack(obs_ctx_list, dim=1)
-    act_ctx = torch.stack(act_ctx_list, dim=1)
+            tok_np = tok.view(-1).cpu().numpy().astype(np.uint16)
+            next_obs, reward, terminated, truncated, _ = self.env.step(0)
 
-    terminated = truncated = False
-    while not (terminated or truncated):
-        if use_zh:
-            h, z, _, _ = world_model.encode_state_and_frame(obs_ctx, act_ctx)
+            self.tok_buf.append(tok_np)
+            self.act_buf.append(0)
+            self.rew_buf.append(float(reward))
+            self.done_buf.append(bool(terminated or truncated))
+
+            obs = next_obs
+            if terminated or truncated:
+                return False
+
+        self.obs_ctx = torch.stack(obs_ctx_list, dim=1)
+        self.act_ctx = torch.stack(act_ctx_list, dim=1)
+        return True
+
+    @torch.no_grad()
+    def step(self):
+        """1 passo real: escolhe a acao (epsilon-aleatoria / argmax
+        deterministico / amostra estocastica), aplica no ambiente, atualiza
+        a janela deslizante e os buffers achatados. Devolve `done` (bool)."""
+        if self.use_zh:
+            h, z, _, _ = self.world_model.encode_state_and_frame(self.obs_ctx, self.act_ctx)
             state = torch.cat([h, z], dim=-1)
         else:
-            state, _, _ = world_model.encode_state(obs_ctx, act_ctx)
+            state, _, _ = self.world_model.encode_state(self.obs_ctx, self.act_ctx)
 
-        if np.random.rand() < epsilon:
-            action_id = int(np.random.randint(n_actions))
-        elif deterministic:
-            logits, _ = actor_critic.forward(state)
+        if np.random.rand() < self.epsilon:
+            action_id = int(np.random.randint(self.n_actions))
+        elif self.deterministic:
+            logits, _ = self.actor_critic.forward(state)
             action_id = int(logits.argmax(dim=-1).item())
         else:
-            action, _, _, _ = actor_critic.act(state)
+            action, _, _, _ = self.actor_critic.act(state)
             action_id = int(action.item())
 
-        current_tok = obs_ctx[:, -1, :].view(-1).cpu().numpy().astype(np.uint16)
-        next_obs, reward, terminated, truncated, _ = env.step(action_id)
+        current_tok = self.obs_ctx[:, -1, :].view(-1).cpu().numpy().astype(np.uint16)
+        next_obs, reward, terminated, truncated, _ = self.env.step(action_id)
+        done = bool(terminated or truncated)
 
-        tok_buf.append(current_tok)
-        act_buf.append(action_id)
-        rew_buf.append(float(reward))
-        done_buf.append(bool(terminated or truncated))
+        self.tok_buf.append(current_tok)
+        self.act_buf.append(action_id)
+        self.rew_buf.append(float(reward))
+        self.done_buf.append(done)
 
-        next_tok = vqvae.encode_indices(frame_to_tensor(next_obs, device)).view(1, -1)
-        obs_ctx = torch.cat([obs_ctx[:, 1:], next_tok.unsqueeze(1)], dim=1)
-        act_ctx = torch.cat([act_ctx[:, 1:], torch.tensor([[action_id]], device=device)], dim=1)
-        obs = next_obs
+        next_tok = self.vqvae.encode_indices(frame_to_tensor(next_obs, self.device)).view(1, -1)
+        self.obs_ctx = torch.cat([self.obs_ctx[:, 1:], next_tok.unsqueeze(1)], dim=1)
+        self.act_ctx = torch.cat([self.act_ctx[:, 1:], torch.tensor([[action_id]], device=self.device)], dim=1)
+        return done
 
-    return {
-        "tokens": np.stack(tok_buf).astype(np.uint16),      # (T, 64)
-        "actions": np.array(act_buf, dtype=np.int32),        # (T,)
-        "rewards": np.array(rew_buf, dtype=np.float32),      # (T,)
-        "dones": np.array(done_buf, dtype=np.uint8),         # (T,)
-    }
+    def episode_arrays(self):
+        """Devolve o episodio acumulado ate agora no formato dataset_tokens."""
+        return {
+            "tokens": np.stack(self.tok_buf).astype(np.uint16),   # (T, 64)
+            "actions": np.array(self.act_buf, dtype=np.int32),     # (T,)
+            "rewards": np.array(self.rew_buf, dtype=np.float32),   # (T,)
+            "dones": np.array(self.done_buf, dtype=np.uint8),      # (T,)
+        }
+
+
+def collect_episode_for_dataset(env, world_model, vqvae, actor_critic, context_len, device,
+                                 skip_frames, epsilon, deterministic, seed, use_zh, n_actions):
+    """Roda 1 episodio completo via RealEpisodeStepper e devolve os 4 arrays
+    no formato dataset_tokens. Devolve None se o episodio terminou durante
+    o warmup (zoom-in ou montagem da janela de contexto) -- raro, descartado
+    sem contar pro total (CarRacingTokenDataset tambem ignora episodios com
+    T < context_len+1, entao um episodio assim nao renderia nenhuma janela
+    de treino de qualquer forma)."""
+    stepper = RealEpisodeStepper(
+        env, world_model, vqvae, actor_critic, context_len, device,
+        skip_frames, epsilon, deterministic, use_zh, n_actions,
+    )
+    if not stepper.reset(seed):
+        return None
+
+    done = False
+    while not done:
+        done = stepper.step()
+
+    return stepper.episode_arrays()
 
 
 def collect(args):

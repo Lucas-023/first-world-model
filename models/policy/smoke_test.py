@@ -6,13 +6,16 @@ Modelos minusculos, pesos aleatorios, roda em segundos na CPU. Sem pytest
 Uso: python -m models.policy.smoke_test
 """
 
+import numpy as np
 import torch
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
+from models.dynamics.dataset import reward_to_class
 from models.policy.modules import ActorCritic
 from models.policy.rollout import collect_rollout, compute_active_mask, compute_gae
 from models.policy.train_dream import ppo_update
 from models.policy.train_real_dreamer import pad_and_concat_batches
+from models.policy.online_buffer import OnlineReplayBuffer
 
 
 def tiny_world_model():
@@ -193,6 +196,76 @@ def test_pack_and_concat():
     print("OK: 6) padding+concat real/imaginado marca preenchimento como inativo")
 
 
+def test_online_buffer():
+    """models/policy/online_buffer.py::OnlineReplayBuffer -- trava de
+    regressao pra 3 coisas: (1) amostragem pondera por numero de janelas
+    por episodio (nao por episodio uniformemente -- reproduz a mesma
+    distribuicao de CarRacingTokenDataset); (2) conversao de reward pra
+    classe bate com dataset.py::reward_to_class; (3) FIFO por capacidade
+    descarta o episodio mais antigo por inteiro, sem deixar janela orfa em
+    window_index."""
+    context_len = 5
+    device = torch.device("cpu")
+
+    def fake_episode(T, seed):
+        rng = np.random.default_rng(seed)
+        return {
+            "tokens": rng.integers(0, 512, size=(T, 64)).astype(np.uint16),
+            "actions": rng.integers(0, 5, size=(T,)).astype(np.int32),
+            "rewards": rng.normal(size=(T,)).astype(np.float32),
+            "dones": np.array([0] * (T - 1) + [1], dtype=np.uint8),
+        }
+
+    buf = OnlineReplayBuffer(capacity_steps=1000, context_len=context_len, device=device)
+    ep_a = fake_episode(10, seed=1)   # 10 - 5 = 5 janelas
+    ep_b = fake_episode(20, seed=2)   # 20 - 5 = 15 janelas
+    ep_c = fake_episode(3, seed=3)    # curto demais (T < context_len+1=6): 0 janelas, mas conta pra capacidade
+
+    buf.add_episode(ep_a)
+    buf.add_episode(ep_b)
+    buf.add_episode(ep_c)
+
+    assert buf.total_steps == 10 + 20 + 3
+    assert len(buf) == 5 + 15 + 0, "amostragem tem que ponderar por janelas/episodio, nao por episodio"
+    assert buf.num_episodes() == 3
+
+    obs_ctx, act_ctx, obs_tgt, rew_tgt, done_tgt = buf.sample_training_windows(16, device)
+    assert obs_ctx.shape == (16, context_len, 64) and obs_ctx.dtype == torch.int64
+    assert act_ctx.shape == (16, context_len) and act_ctx.dtype == torch.int64
+    assert obs_tgt.shape == (16, 64) and obs_tgt.dtype == torch.int64
+    assert rew_tgt.shape == (16,) and rew_tgt.dtype == torch.int64
+    assert done_tgt.shape == (16,) and done_tgt.dtype == torch.int64
+    assert bool(((rew_tgt >= 0) & (rew_tgt <= 2)).all()), "classe de reward tem que estar em {0,1,2}"
+
+    seed_obs_ctx, seed_act_ctx = buf.sample_seed_contexts(8, device)
+    assert seed_obs_ctx.shape == (8, context_len, 64)
+    assert seed_act_ctx.shape == (8, context_len)
+
+    # conversao de reward bate com a MESMA funcao que o dataset offline usa --
+    # reconfirma comparando ep.rewards_class (calculado dentro do buffer) com
+    # uma nova chamada de reward_to_class sobre o reward bruto do episodio
+    # original (identificado pelo tamanho: T=10 -> ep_a, T=20 -> ep_b)
+    eid, start = buf.window_index[0]
+    ep = buf.episodes_by_id[eid]
+    target_idx = start + context_len
+    raw = ep_a["rewards"] if ep["tokens"].shape[0] == 10 else ep_b["rewards"]
+    assert ep["rewards_class"][target_idx] == reward_to_class(raw[target_idx:target_idx + 1])[0]
+
+    # FIFO: capacidade estourada descarta o episodio mais antigo por inteiro,
+    # sem deixar janela orfa em window_index
+    buf2 = OnlineReplayBuffer(capacity_steps=25, context_len=context_len, device=device)
+    buf2.add_episode(fake_episode(10, seed=10))   # eid=0
+    buf2.add_episode(fake_episode(10, seed=11))   # eid=1
+    buf2.add_episode(fake_episode(10, seed=12))   # eid=2, total=30 > 25 -> descarta eid=0
+    assert buf2.num_episodes() == 2
+    assert buf2.total_steps == 20
+    assert len(buf2) == 10  # 2 episodios de 10 passos, 5 janelas cada
+    assert 0 not in buf2.episode_order
+    assert all(eid != 0 for eid, _ in buf2.window_index), "janela orfa apontando pro episodio descartado"
+
+    print("OK: 7) OnlineReplayBuffer -- amostragem ponderada, classe de reward e FIFO corretos")
+
+
 if __name__ == "__main__":
     test_shapes()
     test_act_token_inertness()
@@ -200,4 +273,5 @@ if __name__ == "__main__":
     test_gradient_isolation()
     test_gae_masking()
     test_pack_and_concat()
+    test_online_buffer()
     print("\nTodos os smoke tests passaram.")

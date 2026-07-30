@@ -1,23 +1,32 @@
 """
-Treina o ActorCritic (models/policy/modules.py) via PPO com INTERACAO REAL no
-CarRacing-v3 -- nao dentro do sonho do World Model. A cada passo, o frame real
-e tokenizado (VQVAE.encode_indices) e passa por WorldModel.encode_state
-(congelado) pra virar state_repr; a acao escolhida e aplicada de verdade no
-gym, e reward/done sao os REAIS do ambiente (nao a classe {-1,0,+1} que o
-World Model preve).
+Treino hibrido: interacao real no CarRacing-v3 + ramos imaginados pelo World
+Model a partir dos estados reais visitados -- o desenho original do Dreamer
+(Hafner et al.): a politica age de verdade no ambiente pra visitar estados,
+mas o World Model congelado "sonha" H passos a frente a partir desses estados
+reais pra gerar sinal de treino extra sem gastar mais passos reais.
 
-Isola a pergunta "a representacao aprendida pelo World Model, sozinha, basta
-pra controlar o carro via interacao real?" -- comparavel a
-models/policy/train_dream.py (mesma politica/PPO, zero passos reais) e a
-agente_coleta/train.py (mesma interacao real, mas pixels crus + CNN treinada
-do zero em vez do World Model congelado). NAO isola "sonho vs. real" sozinho
-(muda representacao E fonte de reward ao mesmo tempo em relacao ao
-train_dream.py) -- a comparacao limpa que este script permite e contra o PPO
-direto em pixels (agente_coleta), nao contra a politica via sonho.
+Diferenca pra train_real_latent.py: aquele so usa o World Model como
+codificador do frame atual (encode_state uma vez por passo, nunca chama
+imagine_next_frame). Aqui, a cada --branch_every passos reais, a janela de
+contexto daquele instante vira uma "ancora" e o World Model imagina
+--horizon passos a frente dali (reaproveitando models/policy/rollout.py::
+collect_rollout sem modificacao) -- os dois buffers (real e imaginado) sao
+combinados num so buffer (H,B,...) e treinados juntos via ppo_update.
+
+encode_state/imagine_next_frame sao stateless por chamada (kv_cache e
+variavel local, recriada do zero a cada chamada -- confirmado lendo
+gptdynamics.py e git log -p 5de30b8f6), entao branch/interleaving entre a
+trajetoria real e os ramos imaginados nao precisa de nenhum gerenciamento de
+cache.
+
+Escopo desta primeira versao: so state_repr (h, 256-d), igual
+train_real_latent.py. A variante [h,z] (train_real_latent_zh.py) fica pra
+depois, se este hibrido mostrar ganho real -- precisaria de uma variante de
+collect_rollout que use encode_state_and_frame nos ramos imaginados.
 
 Uso:
-    python -m models.policy.train_real_latent --updates 500 --episodes_per_update 8
-    python -m models.policy.train_real_latent --benchmark_only
+    python -m models.policy.train_real_dreamer --updates 500 --episodes_per_update 8
+    python -m models.policy.train_real_dreamer --benchmark_only
 """
 
 import os
@@ -29,21 +38,26 @@ import torch
 
 from models.policy.modules import ActorCritic
 from models.policy.train_dream import load_world_model, ppo_update
-from models.policy.eval_real_env import make_eval_env, frame_to_tensor, _warmup, run_episode_policy
+from models.policy.train_real_latent import compute_episode_gae, pack_real_batch
+from models.policy.rollout import collect_rollout
+from models.policy.eval_real_env import make_eval_env, run_episode_policy, frame_to_tensor, _warmup
 from models.encoder.modules import VQVAE
 from models.encoder.board import Board
 
-# seeds do mini-eval periodico -- bem acima de qualquer seed que collect_batch
-# possa gerar (seed_base = args.seed + update*episodes_per_update), pra nunca
-# reutilizar uma pista ja vista no treino
+# seeds do mini-eval periodico -- bem acima de qualquer seed que
+# collect_batch_hybrid possa gerar (seed_base = args.seed + update*episodes_per_update),
+# pra nunca reutilizar uma pista ja vista no treino
 EVAL_SEED_BASE = 10_000_000
 
 
 @torch.no_grad()
-def collect_episode(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, seed):
-    """Roda 1 episodio completo com a politica atual, guardando tudo que o PPO
-    precisa. Retorna None se o episodio terminou durante o warmup (raro, mas
-    possivel -- descartado sem contar pro batch)."""
+def collect_episode_with_anchors(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, seed, branch_every):
+    """Roda 1 episodio real completo (mesma logica de
+    train_real_latent.py::collect_episode), guardando alem disso uma "ancora"
+    (obs_ctx, act_ctx) a cada `branch_every` passos reais -- a janela de
+    contexto real naquele instante, capturada ANTES de escolher a acao do
+    passo (semente valida pra um ramo imaginado a partir dali). Retorna None
+    se o episodio terminou durante o warmup."""
     obs, _ = env.reset(seed=seed)
     obs, ended = _warmup(env, skip_frames)
     if ended:
@@ -62,8 +76,13 @@ def collect_episode(env, world_model, vqvae, actor_critic, context_len, device, 
     act_ctx = torch.stack(act_ctx_list, dim=1)
 
     states, actions, log_probs, values, rewards = [], [], [], [], []
+    anchors = []
+    step_idx = 0
     terminated = truncated = False
     while not (terminated or truncated):
+        if step_idx % branch_every == 0:
+            anchors.append((obs_ctx.clone(), act_ctx.clone()))
+
         state, _, _ = world_model.encode_state(obs_ctx, act_ctx)
         action, log_prob, value, _ = actor_critic.act(state)
 
@@ -79,9 +98,8 @@ def collect_episode(env, world_model, vqvae, actor_critic, context_len, device, 
         next_tok = vqvae.encode_indices(frame_to_tensor(obs, device)).view(1, -1)
         obs_ctx = torch.cat([obs_ctx[:, 1:], next_tok.unsqueeze(1)], dim=1)
         act_ctx = torch.cat([act_ctx[:, 1:], action.unsqueeze(1)], dim=1)
+        step_idx += 1
 
-    # bootstrap: 0 se terminou de verdade (saiu da pista); V(s_T) se foi so o
-    # limite de tempo do gym (truncated) -- pratica padrao de PPO
     if terminated:
         bootstrap_value = torch.zeros((), device=device)
     else:
@@ -96,37 +114,22 @@ def collect_episode(env, world_model, vqvae, actor_critic, context_len, device, 
         "values": torch.stack(values).float(),
         "rewards": torch.tensor(rewards, dtype=torch.float32, device=device),
         "bootstrap_value": bootstrap_value.float(),
+        "anchors": anchors,
     }
 
 
-def compute_episode_gae(rewards, values, bootstrap_value, gamma, gae_lambda):
-    """GAE padrao pra 1 trajetoria completa (sem done intermediario -- o
-    episodio so termina no ultimo passo, por construcao de collect_episode)."""
-    T = rewards.shape[0]
-    advantages = torch.zeros_like(rewards)
-    last_gae = torch.zeros((), device=rewards.device, dtype=rewards.dtype)
-    next_value = bootstrap_value
-    for t in reversed(range(T)):
-        delta = rewards[t] + gamma * next_value - values[t]
-        last_gae = delta + gamma * gae_lambda * last_gae
-        advantages[t] = last_gae
-        next_value = values[t]
-    returns = advantages + values
-    return advantages, returns
-
-
-def pack_real_batch(episodes, device):
-    """Empacota uma lista de episodios reais (cada um ja com states/actions/
-    log_probs/advantages/returns/rewards calculados) num buffer (H,B,...) com
-    active_mask -- mesmo formato que models/policy/rollout.py usa pro rollout
-    imaginado, entao reutiliza ppo_update sem modificacao. H = duracao do
-    episodio mais longo do batch; episodios mais curtos ficam com
-    active_mask=0 depois do proprio fim (preenchimento com zeros, nunca lido
-    pela loss). Reaproveitado por train_real_dreamer.py pra empacotar os
-    episodios reais antes de combinar com o buffer imaginado."""
-    H = max(ep["states"].shape[0] for ep in episodes)
-    B = len(episodes)
-    state_dim = episodes[0]["states"].shape[-1]
+def pad_and_concat_batches(buf_a, buf_b, device):
+    """Combina dois buffers (H,B,...) com chaves states/actions/log_probs/
+    advantages/returns/active_mask/rewards -- faz padding do eixo H de ambos
+    pro maximo comum (zeros + active_mask=0 no preenchimento, mesmo padrao
+    ja usado em pack_real_batch) e concatena no eixo do batch (dim=1).
+    ppo_update nao precisa mudar: ja trata (H,B,...) generico via
+    active_mask."""
+    H_a, B_a = buf_a["actions"].shape
+    H_b, B_b = buf_b["actions"].shape
+    H = max(H_a, H_b)
+    B = B_a + B_b
+    state_dim = buf_a["states"].shape[-1]
 
     states = torch.zeros(H, B, state_dim, device=device)
     actions = torch.zeros(H, B, dtype=torch.long, device=device)
@@ -136,32 +139,42 @@ def pack_real_batch(episodes, device):
     active_mask = torch.zeros(H, B, device=device)
     rewards = torch.zeros(H, B, device=device)
 
-    for b, ep in enumerate(episodes):
-        T = ep["states"].shape[0]
-        states[:T, b] = ep["states"]
-        actions[:T, b] = ep["actions"]
-        log_probs[:T, b] = ep["log_probs"]
-        advantages[:T, b] = ep["advantages"]
-        returns[:T, b] = ep["returns"]
-        active_mask[:T, b] = 1.0
-        rewards[:T, b] = ep["rewards"]
+    states[:H_a, :B_a] = buf_a["states"]
+    actions[:H_a, :B_a] = buf_a["actions"]
+    log_probs[:H_a, :B_a] = buf_a["log_probs"]
+    advantages[:H_a, :B_a] = buf_a["advantages"]
+    returns[:H_a, :B_a] = buf_a["returns"]
+    active_mask[:H_a, :B_a] = buf_a["active_mask"]
+    rewards[:H_a, :B_a] = buf_a["rewards"]
+
+    states[:H_b, B_a:] = buf_b["states"]
+    actions[:H_b, B_a:] = buf_b["actions"]
+    log_probs[:H_b, B_a:] = buf_b["log_probs"]
+    advantages[:H_b, B_a:] = buf_b["advantages"]
+    returns[:H_b, B_a:] = buf_b["returns"]
+    active_mask[:H_b, B_a:] = buf_b["active_mask"]
+    rewards[:H_b, B_a:] = buf_b["rewards"]
 
     return {
         "states": states, "actions": actions, "log_probs": log_probs,
         "advantages": advantages, "returns": returns, "active_mask": active_mask,
         "rewards": rewards,
-        "episode_rewards": [ep["rewards"].sum().item() for ep in episodes],
-        "episode_lengths": [ep["states"].shape[0] for ep in episodes],
     }
 
 
-def collect_batch(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, n_episodes, gamma, gae_lambda, seed_base):
-    """Roda `n_episodes` episodios reais completos e empacota via
-    pack_real_batch."""
+def collect_batch_hybrid(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, n_episodes, gamma, gae_lambda, seed_base, branch_every, horizon):
+    """Roda `n_episodes` episodios reais completos (coletando ancoras pelo
+    caminho), empacota o buffer real, imagina `horizon` passos a frente de
+    TODAS as ancoras coletadas numa unica chamada batched de collect_rollout,
+    e combina os dois buffers pra um so update de PPO. Retorna o buffer
+    combinado + estatisticas separadas (reais vs. imaginadas) pra log."""
     episodes = []
     tries = 0
     while len(episodes) < n_episodes:
-        data = collect_episode(env, world_model, vqvae, actor_critic, context_len, device, skip_frames, seed=seed_base + tries)
+        data = collect_episode_with_anchors(
+            env, world_model, vqvae, actor_critic, context_len, device, skip_frames,
+            seed=seed_base + tries, branch_every=branch_every,
+        )
         tries += 1
         if data is None:
             continue
@@ -170,7 +183,23 @@ def collect_batch(env, world_model, vqvae, actor_critic, context_len, device, sk
         data["returns"] = ret
         episodes.append(data)
 
-    return pack_real_batch(episodes, device)
+    real_buffer = pack_real_batch(episodes, device)
+
+    anchors = [a for ep in episodes for a in ep["anchors"]]
+    obs_ctx_batch = torch.cat([a[0] for a in anchors], dim=0)
+    act_ctx_batch = torch.cat([a[1] for a in anchors], dim=0)
+    imagined_buffer = collect_rollout(world_model, actor_critic, obs_ctx_batch, act_ctx_batch, horizon, gamma, gae_lambda)
+
+    combined = pad_and_concat_batches(real_buffer, imagined_buffer, device)
+
+    active_sum = imagined_buffer["active_mask"].sum().clamp(min=1.0)
+    imagined_mean_reward = (imagined_buffer["rewards"] * imagined_buffer["active_mask"]).sum().item() / active_sum.item()
+
+    combined["episode_rewards"] = real_buffer["episode_rewards"]
+    combined["episode_lengths"] = real_buffer["episode_lengths"]
+    combined["n_anchors"] = len(anchors)
+    combined["imagined_mean_reward"] = imagined_mean_reward
+    return combined
 
 
 def train(args):
@@ -197,17 +226,39 @@ def train(args):
     env = make_eval_env(args.frame_skip, args.img_size, args.crop_rows, render=False)
 
     if args.benchmark_only:
+        is_cuda = device.startswith("cuda")
+
         start = time.time()
-        buf = collect_batch(
-            env, world_model, vqvae, actor_critic, wm_config.context_len, device,
-            args.skip_frames, args.episodes_per_update, args.gamma, args.gae_lambda, seed_base=args.seed,
-        )
-        elapsed = time.time() - start
-        total_steps = sum(buf["episode_lengths"])
-        print(
-            f"Benchmark: {args.episodes_per_update} episodios reais "
-            f"({total_steps} passos de politica) em {elapsed:.2f}s -> {total_steps / elapsed:.2f} passos/s"
-        )
+        episodes = []
+        tries = 0
+        while len(episodes) < args.episodes_per_update:
+            data = collect_episode_with_anchors(
+                env, world_model, vqvae, actor_critic, wm_config.context_len, device,
+                args.skip_frames, seed=args.seed + tries, branch_every=args.branch_every,
+            )
+            tries += 1
+            if data is None:
+                continue
+            adv, ret = compute_episode_gae(data["rewards"], data["values"], data["bootstrap_value"], args.gamma, args.gae_lambda)
+            data["advantages"] = adv
+            data["returns"] = ret
+            episodes.append(data)
+        if is_cuda:
+            torch.cuda.synchronize()
+        real_elapsed = time.time() - start
+        real_steps = sum(ep["states"].shape[0] for ep in episodes)
+        print(f"Real: {args.episodes_per_update} episodios ({real_steps} passos) em {real_elapsed:.2f}s -> {real_steps / real_elapsed:.2f} passos/s")
+
+        anchors = [a for ep in episodes for a in ep["anchors"]]
+        obs_ctx_batch = torch.cat([a[0] for a in anchors], dim=0)
+        act_ctx_batch = torch.cat([a[1] for a in anchors], dim=0)
+        start = time.time()
+        collect_rollout(world_model, actor_critic, obs_ctx_batch, act_ctx_batch, args.horizon, args.gamma, args.gae_lambda)
+        if is_cuda:
+            torch.cuda.synchronize()
+        imag_elapsed = time.time() - start
+        imag_steps = len(anchors) * args.horizon
+        print(f"Imaginado: {len(anchors)} ancoras x {args.horizon} horizon ({imag_steps} passos) em {imag_elapsed:.2f}s -> {imag_steps / imag_elapsed:.2f} passos/s")
         return
 
     board = Board(args.run_name)
@@ -226,12 +277,13 @@ def train(args):
     else:
         print("Iniciando do zero.")
 
-    print("\nIniciando treino de politica com interacao real (latentes do World Model)...")
+    print("\nIniciando treino hibrido (interacao real + ramos imaginados)...")
     for update in range(start_update, args.updates):
-        buffer = collect_batch(
+        buffer = collect_batch_hybrid(
             env, world_model, vqvae, actor_critic, wm_config.context_len, device,
             args.skip_frames, args.episodes_per_update, args.gamma, args.gae_lambda,
             seed_base=args.seed + update * args.episodes_per_update,
+            branch_every=args.branch_every, horizon=args.horizon,
         )
 
         stats = ppo_update(
@@ -247,20 +299,22 @@ def train(args):
         print(
             f"[Update {update:>5}] policy_loss {stats['policy_loss']:.4f} | "
             f"value_loss {stats['value_loss']:.4f} | entropy {stats['entropy']:.4f} | "
-            f"reward_real_medio {mean_ep_reward:.2f} | duracao_media {mean_ep_len:.1f}"
+            f"reward_real_medio {mean_ep_reward:.2f} | reward_imaginado_medio {buffer['imagined_mean_reward']:.4f} | "
+            f"n_ancoras {buffer['n_anchors']}"
         )
         board.log_scalar("train/policy_loss", stats["policy_loss"], update)
         board.log_scalar("train/value_loss", stats["value_loss"], update)
         board.log_scalar("train/entropy", stats["entropy"], update)
-        board.log_scalar("train/mean_episode_reward", mean_ep_reward, update)
-        board.log_scalar("train/mean_episode_length", mean_ep_len, update)
+        board.log_scalar("train/real_mean_reward", mean_ep_reward, update)
+        board.log_scalar("train/real_mean_episode_length", mean_ep_len, update)
+        board.log_scalar("train/imagined_mean_reward", buffer["imagined_mean_reward"], update)
+        board.log_scalar("train/n_anchors", buffer["n_anchors"], update)
 
-        # mean_ep_reward acima e a media de so --episodes_per_update episodios,
-        # com as MESMAS seeds do update de treino -- ruidoso demais e tendencioso
-        # pra decidir o "melhor" checkpoint (visto na pratica: um treino de 2290
-        # updates com policy_best.pt escolhido assim colapsou sem que o metric
-        # de treino avisasse). Em vez disso, a cada eval_every updates roda um
-        # mini-eval deterministico com seeds fixas nunca vistas no treino.
+        # mesma logica de robustez ja provada necessaria em train_real_latent.py:
+        # o metric de treino (media de poucos episodios/ancoras, seeds que mudam
+        # a cada update) e ruidoso demais pra decidir o "melhor" checkpoint --
+        # em vez disso, mini-eval deterministico periodico com seeds fixas nunca
+        # vistas no treino.
         if update % args.eval_every == 0 or update == args.updates - 1:
             eval_rewards = []
             for i in range(args.eval_episodes):
@@ -281,9 +335,6 @@ def train(args):
                 )
                 print(f"  -> Novo melhor checkpoint (eval determinístico: {best_eval_reward:.2f})")
 
-        # snapshot periodico, nunca sobrescrito -- ponto de recuperacao caso o
-        # treino desestabilize mais adiante (best_path so atualiza em novo recorde,
-        # entao sozinho nao bastava pra recuperar um "meio termo" razoavel)
         if args.ckpt_every > 0 and update % args.ckpt_every == 0:
             torch.save(
                 {"update": update, "actor_critic_state_dict": actor_critic.state_dict(), "best_eval_reward": best_eval_reward},
@@ -309,10 +360,12 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--dynamics_ckpt", type=str, default="models/dynamics/DYNAMICS_GPT/pesos/gpt_ckpt.pt")
     p.add_argument("--vqvae_path", type=str, default="models/VQVAE/ckpt.pt")
-    p.add_argument("--save_dir", type=str, default="models/policy_real_latent")
-    p.add_argument("--run_name", type=str, default="POLICY_REAL_LATENT")
+    p.add_argument("--save_dir", type=str, default="models/policy_real_dreamer")
+    p.add_argument("--run_name", type=str, default="POLICY_REAL_DREAMER")
     p.add_argument("--updates", type=int, default=500, help="interacao real e sequencial (1 env) -- bem mais lento em wall-clock que train_dream.py; comece pequeno e calibre com --benchmark_only")
-    p.add_argument("--episodes_per_update", type=int, default=8, help="episodios reais completos coletados por update (equivalente ao --batch_size do train_dream.py)")
+    p.add_argument("--episodes_per_update", type=int, default=8, help="episodios reais completos coletados por update")
+    p.add_argument("--branch_every", type=int, default=16, help="a cada quantos passos reais tira uma ancora pra imaginar -- com episodios de ~219 passos, da ~13 ancoras/episodio")
+    p.add_argument("--horizon", type=int, default=8, help="passos de imaginacao por ancora -- mesmo valor/justificativa de train_dream.py (techreport.tex: confiabilidade do reward previsto cai depois de ~10-11 passos)")
     p.add_argument("--frame_skip", type=int, default=4)
     p.add_argument("--img_size", type=int, default=64)
     p.add_argument("--crop_rows", type=int, default=12)
@@ -323,14 +376,14 @@ if __name__ == "__main__":
     p.add_argument("--gae_lambda", type=float, default=0.95)
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--ent_coef", type=float, default=0.01)
-    p.add_argument("--vf_coef", type=float, default=0.05, help="default menor que train_dream.py (0.5) -- diagnostico de colapso de entropia no run original ja motivou essa mudanca, ver techreport.tex")
+    p.add_argument("--vf_coef", type=float, default=0.05, help="default menor que train_dream.py (0.5) -- mesmo diagnostico de colapso de entropia que motivou essa mudanca em train_real_latent.py")
     p.add_argument("--max_grad_norm", type=float, default=0.5)
     p.add_argument("--n_epochs", type=int, default=10)
     p.add_argument("--minibatch_size", type=int, default=64)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--eval_every", type=int, default=50, help="a cada N updates, roda um mini-eval deterministico com seeds fixas (nunca vistas no treino) pra decidir o checkpoint 'melhor' -- mais confiavel que a media ruidosa de --episodes_per_update episodios de treino")
+    p.add_argument("--eval_every", type=int, default=50, help="a cada N updates, roda um mini-eval deterministico com seeds fixas (nunca vistas no treino) pra decidir o checkpoint 'melhor'")
     p.add_argument("--eval_episodes", type=int, default=10, help="episodios do mini-eval periodico")
-    p.add_argument("--ckpt_every", type=int, default=100, help="salva um snapshot separado (nao sobrescrito, policy_update{N}.pt) a cada N updates -- ponto de recuperacao caso o treino desestabilize mais adiante")
+    p.add_argument("--ckpt_every", type=int, default=100, help="salva um snapshot separado (nao sobrescrito, policy_update{N}.pt) a cada N updates")
     p.add_argument("--benchmark_only", action="store_true")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()

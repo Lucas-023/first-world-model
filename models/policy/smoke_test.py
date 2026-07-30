@@ -12,6 +12,7 @@ from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
 from models.policy.modules import ActorCritic
 from models.policy.rollout import collect_rollout, compute_active_mask, compute_gae
 from models.policy.train_dream import ppo_update
+from models.policy.train_real_dreamer import pad_and_concat_batches
 
 
 def tiny_world_model():
@@ -152,10 +153,51 @@ def test_gae_masking():
     print("OK: 5) mascara pos-done protege GAE/returns de lixo (linha ativa continua intacta)")
 
 
+def test_pack_and_concat():
+    """train_real_dreamer.py::pad_and_concat_batches combina o buffer real
+    (H,B variavel por episodio) com o buffer imaginado (H=horizon fixo) --
+    trava de regressao pra garantir que o padding do lado mais raso fica
+    marcado como inativo (active_mask=0) e nao vaza lixo pra loss."""
+    device = torch.device("cpu")
+    state_dim = 4
+
+    def fake_buffer(H, B, fill_value):
+        return {
+            "states": torch.full((H, B, state_dim), fill_value),
+            "actions": torch.zeros(H, B, dtype=torch.long),
+            "log_probs": torch.full((H, B), fill_value),
+            "advantages": torch.full((H, B), fill_value),
+            "returns": torch.full((H, B), fill_value),
+            "active_mask": torch.ones(H, B),
+            "rewards": torch.full((H, B), fill_value),
+        }
+
+    buf_a = fake_buffer(H=3, B=2, fill_value=1.0)  # ex.: buffer "real"
+    buf_b = fake_buffer(H=2, B=3, fill_value=2.0)  # ex.: buffer "imaginado" (horizon menor)
+
+    combined = pad_and_concat_batches(buf_a, buf_b, device)
+
+    assert combined["states"].shape == (3, 5, state_dim)
+    assert combined["active_mask"].shape == (3, 5)
+
+    # colunas 0-1 vieram de buf_a (H=3) -- todas as 3 linhas ativas
+    assert torch.equal(combined["active_mask"][:, :2], torch.ones(3, 2))
+    assert torch.equal(combined["states"][:, :2], torch.full((3, 2, state_dim), 1.0))
+
+    # colunas 2-4 vieram de buf_b (H=2) -- so as 2 primeiras linhas ativas,
+    # a 3a linha (padding) tem active_mask=0 e estado zerado
+    assert torch.equal(combined["active_mask"][:2, 2:], torch.ones(2, 3))
+    assert torch.equal(combined["active_mask"][2, 2:], torch.zeros(3))
+    assert torch.equal(combined["states"][:2, 2:], torch.full((2, 3, state_dim), 2.0))
+    assert torch.equal(combined["states"][2, 2:], torch.zeros(3, state_dim))
+    print("OK: 6) padding+concat real/imaginado marca preenchimento como inativo")
+
+
 if __name__ == "__main__":
     test_shapes()
     test_act_token_inertness()
     test_shift_correctness()
     test_gradient_isolation()
     test_gae_masking()
+    test_pack_and_concat()
     print("\nTodos os smoke tests passaram.")

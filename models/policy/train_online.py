@@ -204,6 +204,16 @@ def train(args):
     else:
         print("Iniciando do zero.")
 
+    if start_cycle >= args.cycles:
+        print(
+            f"\nNada a fazer: checkpoint ja esta no ciclo {start_cycle - 1}, "
+            f"que e >= --cycles {args.cycles}. Para continuar, use --cycles maior "
+            f"que {start_cycle - 1}; para recomecar do zero com hiperparametros "
+            f"novos (ex.: apos mudar --vf_coef), use um --save_dir novo em vez de "
+            f"retomar deste."
+        )
+        return
+
     print("\nIniciando loop online (World Model + politica juntos)...")
     for cycle in range(start_cycle, args.cycles):
         for _ in range(args.env_steps_per_cycle):
@@ -337,7 +347,7 @@ if __name__ == "__main__":
     p.add_argument("--gae_lambda", type=float, default=0.95)
     p.add_argument("--clip_range", type=float, default=0.2)
     p.add_argument("--ent_coef", type=float, default=0.01)
-    p.add_argument("--vf_coef", type=float, default=0.5)
+    p.add_argument("--vf_coef", type=float, default=0.05, help="default menor que train_dream.py (0.5) -- diagnostico de colapso de entropia no run original ja motivou essa mudanca (ver techreport.tex), reaproveitado aqui de train_real_latent.py/train_real_dreamer.py")
     p.add_argument("--max_grad_norm", type=float, default=0.5)
     p.add_argument("--n_epochs", type=int, default=10)
     p.add_argument("--minibatch_size", type=int, default=64)

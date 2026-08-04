@@ -52,11 +52,11 @@ def dream(model, seed_obs, seed_act, future_act, temperature, top_k):
     dreamed_obs, dreamed_rew, dreamed_done = [], [], []
     for i in range(future_act.shape[0]):
         act_token = future_act[i:i + 1]
-        next_obs, rew_cls, done_cls = model.imagine_next_frame(
+        next_obs, reward_pred, done_cls = model.imagine_next_frame(
             ctx_obs, ctx_act, act_token, temperature=temperature, top_k=top_k
         )
         dreamed_obs.append(next_obs)
-        dreamed_rew.append(rew_cls)
+        dreamed_rew.append(reward_pred)
         dreamed_done.append(done_cls)
 
         ctx_obs = torch.cat([ctx_obs[:, 1:], next_obs.unsqueeze(1)], dim=1)
@@ -119,7 +119,7 @@ def main():
 
     tokens = torch.from_numpy(ep["tokens"].astype(np.int64)).to(args.device)
     actions = torch.from_numpy(ep["actions"].astype(np.int64)).to(args.device)
-    rewards = torch.from_numpy((np.sign(ep["rewards"].astype(np.float32)) + 1).astype(np.int64)).to(args.device)
+    rewards = torch.from_numpy(ep["rewards"].astype(np.float32)).to(args.device)
     dones = torch.from_numpy(ep["dones"].astype(np.int64)).to(args.device)
 
     T = tokens.shape[0]
@@ -150,10 +150,10 @@ def main():
     save_image(grid, os.path.join(args.output_dir, "comparison.png"))
 
     obs_acc = (dream_obs == real_obs).float().mean().item()
-    rew_acc = (dream_rew == real_rew).float().mean().item()
+    rew_mae = (dream_rew - real_rew).abs().mean().item()
     done_acc = (dream_done == real_done).float().mean().item()
     print(f"Token accuracy: {obs_acc * 100:.2f}%")
-    print(f"Reward class accuracy: {rew_acc * 100:.2f}%")
+    print(f"Reward MAE (escala real): {rew_mae:.4f}")
     print(f"Done accuracy: {done_acc * 100:.2f}%")
 
 

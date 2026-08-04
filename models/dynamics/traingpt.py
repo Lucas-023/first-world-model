@@ -21,9 +21,6 @@ from models.dynamics.dataset import CarRacingTokenDataset
 from models.encoder.board import Board
 
 
-REWARD_LABEL = {0: "neg (-1)", 1: "neutro (0)", 2: "pos (+1)"}
-
-
 def evaluate(model, dataloader, device):
     model.eval()
     device_type = device.split(":")[0]
@@ -62,10 +59,10 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20, b
             # acao aleatoria a cada passo -- antes repetia pra sempre a ultima
             # acao real do contexto, o que so testava "segurar um botao"
             next_act = torch.randint(0, model.config.act_vocab_size, (1,), device=device)
-            next_obs, rew_cls, done_cls = model.imagine_next_frame(ctx_obs, ctx_act, next_act)
+            next_obs, reward_pred, done_cls = model.imagine_next_frame(ctx_obs, ctx_act, next_act)
 
             frames.append(next_obs)
-            rewards.append(rew_cls.item())
+            rewards.append(reward_pred.item())
             dones.append(done_cls.item())
 
             ctx_obs = torch.cat([ctx_obs[:, 1:, :], next_obs.unsqueeze(1)], dim=1)
@@ -80,7 +77,7 @@ def save_dream(model, vqvae, obs_ctx, act_ctx, save_path, device, n_frames=20, b
             board.log_image("dream/frames", grid, step)
 
         print("  -> Sonho (reward/done previstos):")
-        print("     reward:", [REWARD_LABEL[r] for r in rewards])
+        print("     reward:", [f"{r:.3f}" for r in rewards])
         print("     done  :", dones)
 
 

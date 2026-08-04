@@ -25,8 +25,7 @@ def _imagine_next_frame_no_cache(model, obs_tokens, act_tokens, act_token, tempe
     ctx_obs = torch.cat([obs_tokens, next_frame], dim=1)
     ctx_act = torch.cat([act_tokens, act_token.unsqueeze(1)], dim=1)
 
-    _, reward_logits, done_logits = model.encode_state(obs_tokens, act_tokens)
-    reward_pred = reward_logits.argmax(dim=-1)
+    _, reward_pred, done_logits = model.encode_state(obs_tokens, act_tokens)
     done_pred = done_logits.argmax(dim=-1)
 
     for k in range(K):

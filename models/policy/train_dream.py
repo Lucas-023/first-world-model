@@ -25,9 +25,6 @@ from models.policy.rollout import collect_rollout
 from models.encoder.board import Board
 
 
-REWARD_LABEL = {0: "neg (-1)", 1: "neutro (0)", 2: "pos (+1)"}
-
-
 def load_world_model(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     cfg = ckpt.get("config", {})
@@ -66,10 +63,10 @@ def save_policy_dream(world_model, vqvae, actor_critic, obs_ctx, act_ctx, save_p
         for _ in range(n_frames):
             state, _, _ = world_model.encode_state(obs_ctx, act_ctx)
             action, _, _, _ = actor_critic.act(state)
-            next_frame, reward_cls, done_cls = world_model.imagine_next_frame(obs_ctx, act_ctx, action)
+            next_frame, reward_pred, done_cls = world_model.imagine_next_frame(obs_ctx, act_ctx, action)
 
             frames.append(next_frame)
-            rewards.append(reward_cls.item())
+            rewards.append(reward_pred.item())
             dones.append(done_cls.item())
 
             obs_ctx = torch.cat([obs_ctx[:, 1:], next_frame.unsqueeze(1)], dim=1)
@@ -83,7 +80,7 @@ def save_policy_dream(world_model, vqvae, actor_critic, obs_ctx, act_ctx, save_p
             board.log_image("policy_dream/frames", grid, step)
 
     print("  -> Sonho guiado pela politica (reward/done previstos):")
-    print("     reward:", [REWARD_LABEL[r] for r in rewards])
+    print("     reward:", [f"{r:.3f}" for r in rewards])
     print("     done  :", dones)
 
 

@@ -1,13 +1,15 @@
 """
 Dynamics GPT para prever:
 1) tokens da proxima imagem
-2) classe de reward {-1, 0, +1}
+2) reward (regressao escalar em escala symlog, ver models/dynamics/dataset.py)
 3) done {0, 1}
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from models.dynamics.dataset import symexp
 
 
 class WorldModelConfig:
@@ -24,7 +26,6 @@ class WorldModelConfig:
     ):
         self.obs_vocab_size = obs_vocab_size
         self.act_vocab_size = act_vocab_size
-        self.reward_vocab = 3
         self.done_vocab = 2
         self.img_tokens = img_tokens
         self.context_len = context_len
@@ -59,7 +60,7 @@ class WorldModel(nn.Module):
 
         self.head_obs = nn.Linear(config.n_embd, config.obs_vocab_size, bias=False)
         self.head_obs.weight = self.obs_emb.weight
-        self.head_rewards = nn.Linear(config.n_embd, config.reward_vocab)
+        self.head_rewards = nn.Linear(config.n_embd, 1)
         self.head_dones = nn.Linear(config.n_embd, config.done_vocab)
 
         mask = torch.triu(torch.ones(config.block_size, config.block_size), diagonal=1).bool()
@@ -93,6 +94,9 @@ class WorldModel(nn.Module):
         return x
 
     def compute_loss(self, obs_ctx, act_ctx, obs_target, reward_target, done_target):
+        """reward_target: (B,) float32, ja em escala symlog (models/dynamics/dataset.py::symlog)
+        -- a MESMA representacao que head_rewards preve, entao a perda e so MSE direto,
+        sem converter nada aqui."""
         B, T, K = obs_ctx.shape
         device = obs_ctx.device
 
@@ -113,7 +117,7 @@ class WorldModel(nn.Module):
             obs_logits.reshape(-1, self.config.obs_vocab_size),
             obs_target.reshape(-1),
         )
-        loss_rewards = F.cross_entropy(self.head_rewards(ctx_last_repr), reward_target)
+        loss_rewards = F.mse_loss(self.head_rewards(ctx_last_repr).squeeze(-1), reward_target)
         loss_dones = F.cross_entropy(self.head_dones(ctx_last_repr), done_target)
         loss = loss_obs + loss_rewards + loss_dones
         return loss, loss_obs, loss_rewards, loss_dones
@@ -133,11 +137,12 @@ class WorldModel(nn.Module):
     @torch.no_grad()
     def encode_state(self, obs_tokens, act_tokens):
         """
-        Representacao compacta do contexto (B,n_embd) + logits de reward/done.
+        Representacao compacta do contexto (B,n_embd) + reward previsto
+        (escala real, ja convertido de volta via symexp) + logits de done.
 
         obs_tokens: (B,T,64), act_tokens: (B,T).
 
-        Importante: reward_logits/done_logits aqui descrevem a transicao JA
+        Importante: reward_pred/done_logits aqui descrevem a transicao JA
         COMMITADA por act_tokens[:, -1] -- nao uma acao futura. E a mesma
         leitura que compute_loss usa pra treinar head_rewards/head_dones
         (ctx_last_repr = posicao da ultima acao do contexto). act_tokens[:,-1]
@@ -151,7 +156,8 @@ class WorldModel(nn.Module):
             B, T, self.config.tokens_per_block, self.config.n_embd
         )
         state_repr = x[:, -1, -1, :]
-        return state_repr, self.head_rewards(state_repr), self.head_dones(state_repr)
+        reward_pred = symexp(self.head_rewards(state_repr).squeeze(-1))
+        return state_repr, reward_pred, self.head_dones(state_repr)
 
     @torch.no_grad()
     def encode_state_and_frame(self, obs_tokens, act_tokens):
@@ -174,7 +180,8 @@ class WorldModel(nn.Module):
         )
         state_repr = x[:, -1, -1, :]
         frame_repr = x[:, -1, :-1, :].mean(dim=1)
-        return state_repr, frame_repr, self.head_rewards(state_repr), self.head_dones(state_repr)
+        reward_pred = symexp(self.head_rewards(state_repr).squeeze(-1))
+        return state_repr, frame_repr, reward_pred, self.head_dones(state_repr)
 
     def _project_kv(self, layer, normed_x):
         """Projeta K,V de uma camada a partir do input ja normalizado (norm_first=True e
@@ -245,9 +252,8 @@ class WorldModel(nn.Module):
             x = layer(x, src_mask=mask, is_causal=True)
 
         h = x[:, -1, :]  # representacao na ultima posicao do contexto conhecido
-        reward_logits = self.head_rewards(h)
+        reward_pred = symexp(self.head_rewards(h).squeeze(-1))
         done_logits = self.head_dones(h)
-        reward_pred = reward_logits.argmax(dim=-1)
         done_pred = done_logits.argmax(dim=-1)
 
         generated = torch.zeros(B, K, dtype=torch.long, device=device)

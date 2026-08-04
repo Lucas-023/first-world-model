@@ -10,7 +10,7 @@ import numpy as np
 import torch
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
-from models.dynamics.dataset import reward_to_class
+from models.dynamics.dataset import symlog
 from models.policy.modules import ActorCritic
 from models.policy.rollout import collect_rollout, compute_active_mask, compute_gae
 from models.policy.train_dream import ppo_update
@@ -36,9 +36,9 @@ def test_shapes():
     obs_ctx = torch.randint(0, config.obs_vocab_size, (B, T, K))
     act_ctx = torch.randint(0, config.act_vocab_size, (B, T))
 
-    state, rlog, dlog = model.encode_state(obs_ctx, act_ctx)
+    state, reward_pred, dlog = model.encode_state(obs_ctx, act_ctx)
     assert state.shape == (B, config.n_embd)
-    assert rlog.shape == (B, 3)
+    assert reward_pred.shape == (B,)
     assert dlog.shape == (B, 2)
 
     action, log_prob, value, entropy = ac.act(state)
@@ -94,13 +94,13 @@ def test_shift_correctness():
     act_ctx_1_A = torch.cat([act_ctx[:, 1:], action_A.unsqueeze(1)], dim=1)
     act_ctx_1_B = torch.cat([act_ctx[:, 1:], action_B.unsqueeze(1)], dim=1)
 
-    _, rlog_1_A, dlog_1_A = model.encode_state(obs_ctx_1, act_ctx_1_A)
-    _, rlog_1_B, dlog_1_B = model.encode_state(obs_ctx_1, act_ctx_1_B)
-    assert not torch.equal(rlog_1_A, rlog_1_B), "reward_logits do passo seguinte deveria depender de action_0"
+    _, rpred_1_A, dlog_1_A = model.encode_state(obs_ctx_1, act_ctx_1_A)
+    _, rpred_1_B, dlog_1_B = model.encode_state(obs_ctx_1, act_ctx_1_B)
+    assert not torch.equal(rpred_1_A, rpred_1_B), "reward_pred do passo seguinte deveria depender de action_0"
 
     # determinismo: mesma chamada, mesma entrada -> mesma saida (sem no_grad/dropout escondendo ruido)
-    _, rlog_1_A2, dlog_1_A2 = model.encode_state(obs_ctx_1, act_ctx_1_A)
-    assert torch.equal(rlog_1_A, rlog_1_A2) and torch.equal(dlog_1_A, dlog_1_A2)
+    _, rpred_1_A2, dlog_1_A2 = model.encode_state(obs_ctx_1, act_ctx_1_A)
+    assert torch.equal(rpred_1_A, rpred_1_A2) and torch.equal(dlog_1_A, dlog_1_A2)
     print("OK: 3) deslocamento reward/done por 1 passo confirmado")
 
 
@@ -201,7 +201,7 @@ def test_online_buffer():
     regressao pra 3 coisas: (1) amostragem pondera por numero de janelas
     por episodio (nao por episodio uniformemente -- reproduz a mesma
     distribuicao de CarRacingTokenDataset); (2) conversao de reward pra
-    classe bate com dataset.py::reward_to_class; (3) FIFO por capacidade
+    escala symlog bate com dataset.py::symlog; (3) FIFO por capacidade
     descarta o episodio mais antigo por inteiro, sem deixar janela orfa em
     window_index."""
     context_len = 5
@@ -233,23 +233,22 @@ def test_online_buffer():
     assert obs_ctx.shape == (16, context_len, 64) and obs_ctx.dtype == torch.int64
     assert act_ctx.shape == (16, context_len) and act_ctx.dtype == torch.int64
     assert obs_tgt.shape == (16, 64) and obs_tgt.dtype == torch.int64
-    assert rew_tgt.shape == (16,) and rew_tgt.dtype == torch.int64
+    assert rew_tgt.shape == (16,) and rew_tgt.dtype == torch.float32
     assert done_tgt.shape == (16,) and done_tgt.dtype == torch.int64
-    assert bool(((rew_tgt >= 0) & (rew_tgt <= 2)).all()), "classe de reward tem que estar em {0,1,2}"
 
     seed_obs_ctx, seed_act_ctx = buf.sample_seed_contexts(8, device)
     assert seed_obs_ctx.shape == (8, context_len, 64)
     assert seed_act_ctx.shape == (8, context_len)
 
     # conversao de reward bate com a MESMA funcao que o dataset offline usa --
-    # reconfirma comparando ep.rewards_class (calculado dentro do buffer) com
-    # uma nova chamada de reward_to_class sobre o reward bruto do episodio
-    # original (identificado pelo tamanho: T=10 -> ep_a, T=20 -> ep_b)
+    # reconfirma comparando ep.rewards_symlog (calculado dentro do buffer) com
+    # uma nova chamada de symlog sobre o reward bruto do episodio original
+    # (identificado pelo tamanho: T=10 -> ep_a, T=20 -> ep_b)
     eid, start = buf.window_index[0]
     ep = buf.episodes_by_id[eid]
     target_idx = start + context_len
     raw = ep_a["rewards"] if ep["tokens"].shape[0] == 10 else ep_b["rewards"]
-    assert ep["rewards_class"][target_idx] == reward_to_class(raw[target_idx:target_idx + 1])[0]
+    assert np.isclose(ep["rewards_symlog"][target_idx], symlog(raw[target_idx:target_idx + 1])[0])
 
     # FIFO: capacidade estourada descarta o episodio mais antigo por inteiro,
     # sem deixar janela orfa em window_index
@@ -263,7 +262,7 @@ def test_online_buffer():
     assert 0 not in buf2.episode_order
     assert all(eid != 0 for eid, _ in buf2.window_index), "janela orfa apontando pro episodio descartado"
 
-    print("OK: 7) OnlineReplayBuffer -- amostragem ponderada, classe de reward e FIFO corretos")
+    print("OK: 7) OnlineReplayBuffer -- amostragem ponderada, escala symlog de reward e FIFO corretos")
 
 
 if __name__ == "__main__":

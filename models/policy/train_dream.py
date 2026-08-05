@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image, make_grid
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
-from models.dynamics.dataset import CarRacingTokenDataset
+from models.dynamics.dataset import CarRacingTokenDataset, symlog_torch
 from models.policy.modules import ActorCritic
 from models.policy.rollout import collect_rollout
 from models.encoder.board import Board
@@ -119,7 +119,11 @@ def ppo_update(actor_critic, optimizer, buffer, n_epochs, minibatch_size, clip_r
             surr1 = ratio * adv
             surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * adv
             policy_loss = -(torch.min(surr1, surr2) * mask).sum() / mask_sum
-            value_loss = ((values - returns[idx]) ** 2 * mask).sum() / mask_sum
+            # symlog nos dois lados (nao em GAE/vantagem, so aqui): reward real
+            # (dezenas a centenas) faz `returns` variar muito mais do que na
+            # antiga escala de classificacao (+-1), o que inflava value_loss
+            # sem convergir -- ver techreport.tex, secao de regressao do valor.
+            value_loss = ((symlog_torch(values) - symlog_torch(returns[idx])) ** 2 * mask).sum() / mask_sum
             entropy_bonus = (entropy * mask).sum() / mask_sum
 
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy_bonus

@@ -37,6 +37,15 @@ def symexp(y):
     return torch.sign(y) * torch.expm1(torch.abs(y))
 
 
+def symlog_torch(x):
+    """Mesma transformacao de symlog() acima, em torch e com autograd --
+    usada em train_dream.py pra comprimir o alvo (returns) e a predicao
+    (values) da funcao de valor do PPO antes do MSE, evitando que a escala
+    real do reward (dezenas a centenas) infle value_loss. symlog() (numpy)
+    nao serve aqui porque quebra o grafo de gradiente de `values`."""
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+
 class CarRacingTokenDataset(Dataset):
     SPLITS = ("train", "val", "test")
 

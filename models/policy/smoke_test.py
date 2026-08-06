@@ -11,7 +11,7 @@ import torch
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
 from models.dynamics.dataset import symlog
-from models.policy.modules import ActorCritic
+from models.policy.modules import ActorCritic, ReturnNormalizer, soft_update_
 from models.policy.rollout import collect_rollout, compute_active_mask, compute_gae
 from models.policy.train_dream import ppo_update
 from models.policy.train_real_dreamer import pad_and_concat_batches
@@ -196,6 +196,54 @@ def test_pack_and_concat():
     print("OK: 6) padding+concat real/imaginado marca preenchimento como inativo")
 
 
+def test_target_critic_and_return_normalizer():
+    """Trava de regressao pra soft_update_ (EMA do critico-alvo) e
+    ReturnNormalizer (escala de advantage por percentil de retorno,
+    DreamerV3): (1) soft_update_ move o alvo em direcao a fonte pela fracao
+    exata de (1-decay), nunca copia tudo de uma vez; (2) ReturnNormalizer SO
+    escala (nao centraliza) e a faixa aprendida bate com os percentis reais
+    dos retornos de entrada; (3) collect_rollout aceita target_actor_critic e
+    ppo_update aceita return_normalizer sem quebrar formas/gradiente."""
+    torch.manual_seed(0)
+    model, config = tiny_world_model()
+    ac = ActorCritic(state_dim=config.n_embd, n_actions=config.act_vocab_size, hidden_dim=16)
+    target_ac = ActorCritic(state_dim=config.n_embd, n_actions=config.act_vocab_size, hidden_dim=16)
+
+    p_before = [p.clone() for p in target_ac.parameters()]
+    decay = 0.9
+    soft_update_(target_ac, ac, decay)
+    for p_old, p_new, p_src in zip(p_before, target_ac.parameters(), ac.parameters()):
+        expected = decay * p_old + (1 - decay) * p_src
+        assert torch.allclose(p_new, expected, atol=1e-6), "soft_update_ deveria mover o alvo por exatamente (1-decay) em direcao a fonte"
+
+    normalizer = ReturnNormalizer(decay=0.5, low=0.05, high=0.95)
+    returns = torch.cat([torch.linspace(-1, 1, 98), torch.tensor([100.0, -100.0])])  # outliers extremos
+    active_mask = torch.ones_like(returns)
+    scale1 = normalizer.update_and_get_scale(returns, active_mask)
+    lo = torch.quantile(returns, 0.05).item()
+    hi = torch.quantile(returns, 0.95).item()
+    assert abs(scale1 - (hi - lo)) < 1e-3, "primeira chamada deveria inicializar direto na faixa real (sem EMA ainda)"
+    assert scale1 < 50, "outliers isolados (100/-100) nao deveriam dominar a escala (isso e o ponto de usar percentil, nao min/max)"
+
+    returns2 = returns * 10  # faixa bem maior
+    scale2 = normalizer.update_and_get_scale(returns2, active_mask)
+    assert scale1 < scale2 < (torch.quantile(returns2, 0.95) - torch.quantile(returns2, 0.05)).item() + 1e-3, \
+        "segunda chamada deveria suavizar (EMA) em direcao a nova faixa, nao pular direto pra ela"
+
+    B, T, K = 4, config.context_len, config.img_tokens
+    obs_ctx = torch.randint(0, config.obs_vocab_size, (B, T, K))
+    act_ctx = torch.randint(0, config.act_vocab_size, (B, T))
+    buffer = collect_rollout(model, ac, obs_ctx, act_ctx, horizon=4, target_actor_critic=target_ac)
+    opt = torch.optim.Adam(ac.parameters(), lr=1e-3)
+    ppo_update(
+        ac, opt, buffer, n_epochs=1, minibatch_size=4, clip_range=0.2, ent_coef=0.01, vf_coef=0.5,
+        max_grad_norm=0.5, return_normalizer=normalizer,
+    )
+    for p in model.parameters():
+        assert p.grad is None, "gradiente vazou pro World Model"
+    print("OK: 8) critico-alvo EMA e normalizacao de advantage por percentil")
+
+
 def test_online_buffer():
     """models/policy/online_buffer.py::OnlineReplayBuffer -- trava de
     regressao pra 3 coisas: (1) amostragem pondera por numero de janelas
@@ -272,5 +320,6 @@ if __name__ == "__main__":
     test_gradient_isolation()
     test_gae_masking()
     test_pack_and_concat()
+    test_target_critic_and_return_normalizer()
     test_online_buffer()
     print("\nTodos os smoke tests passaram.")

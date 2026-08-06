@@ -42,3 +42,54 @@ class ActorCritic(nn.Module):
         logits, value = self.forward(state)
         dist = Categorical(logits=logits)
         return dist.log_prob(action), value, dist.entropy()
+
+
+@torch.no_grad()
+def soft_update_(target, source, decay):
+    """Critico-alvo suavizado por EMA (DreamerV3): apos cada update de PPO,
+    target = decay*target + (1-decay)*source, no lugar de copiar o peso
+    inteiro de uma vez. Usado pra estabilizar os alvos de valor (values do
+    rollout/bootstrap) contra a rede que esta sendo atualizada a cada passo
+    de gradiente -- ver techreport.tex, secao de proximos passos apos o fix
+    de symlog no value_loss."""
+    for tp, sp in zip(target.parameters(), source.parameters()):
+        tp.data.mul_(decay).add_(sp.data, alpha=1 - decay)
+
+
+class ReturnNormalizer(nn.Module):
+    """Escala vantagens por uma faixa de percentil dos retornos (DreamerV3:
+    "return normalization by percentile range"), suavizada por EMA entre
+    updates -- substitui a normalizacao z-score (media/desvio) recalculada do
+    zero a cada minibatch. Duas diferencas deliberadas: (1) so ESCALA, nao
+    centraliza -- a vantagem ja e ~zero-media por construcao (GAE); (2) a
+    faixa (percentil alto - percentil baixo) e suave ao longo de MUITOS
+    updates, entao um unico retorno extremo (ex.: done fora da pista, ordens
+    de grandeza acima do resto) nao domina a escala de um minibatch inteiro
+    como o desvio padrao por lote fazia."""
+
+    def __init__(self, decay=0.99, low=0.05, high=0.95):
+        super().__init__()
+        self.decay = decay
+        self.low = low
+        self.high = high
+        self.register_buffer("p_low", torch.zeros(1))
+        self.register_buffer("p_high", torch.zeros(1))
+        self.register_buffer("initialized", torch.zeros(1, dtype=torch.bool))
+
+    @torch.no_grad()
+    def update_and_get_scale(self, returns, active_mask):
+        active = active_mask.reshape(-1).bool()
+        vals = returns.reshape(-1)[active]
+        if vals.numel() == 0:
+            return max((self.p_high - self.p_low).item(), 1.0)
+
+        lo = torch.quantile(vals, self.low)
+        hi = torch.quantile(vals, self.high)
+        if not bool(self.initialized.item()):
+            self.p_low.copy_(lo.reshape(1))
+            self.p_high.copy_(hi.reshape(1))
+            self.initialized.fill_(True)
+        else:
+            self.p_low.mul_(self.decay).add_(lo.reshape(1) * (1 - self.decay))
+            self.p_high.mul_(self.decay).add_(hi.reshape(1) * (1 - self.decay))
+        return max((self.p_high - self.p_low).item(), 1.0)

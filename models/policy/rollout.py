@@ -51,7 +51,7 @@ def compute_gae(rewards, values, dones, active_mask, bootstrap_value, gamma=0.99
 
 
 @torch.no_grad()
-def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=0.99, gae_lambda=0.95):
+def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=0.99, gae_lambda=0.95, target_actor_critic=None):
     """
     obs_ctx: (B,context_len,64) long -- seed real (janela de contexto).
     act_ctx: (B,context_len) long -- seed real.
@@ -59,9 +59,16 @@ def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=
     Roda `horizon` passos de imaginacao guiados pela politica. Retorna dict
     de tensores (H,B,...): states, actions, log_probs, values, rewards,
     dones, active_mask, advantages, returns.
+
+    target_actor_critic: se fornecido, os VALORES (baseline do GAE e bootstrap
+    de s_H) vem dessa rede (copia suavizada por EMA, ver modules.py::
+    soft_update_) em vez de `actor_critic` -- a acao/log_prob continua
+    sempre vindo de `actor_critic` (a politica em treino, on-policy). Alvo
+    mais estavel pro GAE, sem atrasar a escolha de acao.
     """
     device = obs_ctx.device
     device_type = device.type
+    critic = target_actor_critic if target_actor_critic is not None else actor_critic
 
     states, actions, log_probs, values = [], [], [], []
     reward_pred_list, done_logits_list = [], []
@@ -69,7 +76,8 @@ def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=
     with autocast(device_type=device_type):
         for _ in range(horizon):
             state_t, reward_pred_t, done_logits_t = world_model.encode_state(obs_ctx, act_ctx)
-            action_t, log_prob_t, value_t, _ = actor_critic.act(state_t)
+            action_t, log_prob_t, _, _ = actor_critic.act(state_t)
+            _, value_t = critic.forward(state_t)
             next_frame, _, _ = world_model.imagine_next_frame(obs_ctx, act_ctx, action_t)
 
             states.append(state_t.float())
@@ -84,7 +92,7 @@ def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=
 
         # chamada extra: reward/done de action_{H-1} + bootstrap value de s_H
         state_H, reward_pred_H, done_logits_H = world_model.encode_state(obs_ctx, act_ctx)
-        _, bootstrap_value = actor_critic.forward(state_H)
+        _, bootstrap_value = critic.forward(state_H)
         bootstrap_value = bootstrap_value.float()
     reward_pred_list.append(reward_pred_H.float())
     done_logits_list.append(done_logits_H)

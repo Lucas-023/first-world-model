@@ -34,12 +34,13 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
+import copy
 import time
 import torch
 from torch.amp import autocast, GradScaler
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
-from models.policy.modules import ActorCritic
+from models.policy.modules import ActorCritic, ReturnNormalizer, soft_update_
 from models.policy.rollout import collect_rollout
 from models.policy.train_dream import ppo_update, save_policy_dream
 from models.policy.eval_real_env import make_eval_env, run_episode_policy
@@ -80,15 +81,19 @@ def wm_grad_step(world_model, wm_optimizer, scaler, buffer, batch_size, device_t
     return loss.item(), l_obs.item(), l_rew.item(), l_done.item()
 
 
-def policy_update_step(world_model, actor_critic, policy_optimizer, buffer, args, device):
+def policy_update_step(world_model, actor_critic, target_actor_critic, return_normalizer, policy_optimizer, buffer, args, device):
     obs_ctx, act_ctx = buffer.sample_seed_contexts(args.seed_batch_size, device)
-    rollout_buf = collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, args.horizon, args.gamma, args.gae_lambda)
+    rollout_buf = collect_rollout(
+        world_model, actor_critic, obs_ctx, act_ctx, args.horizon, args.gamma, args.gae_lambda,
+        target_actor_critic=target_actor_critic,
+    )
     stats = ppo_update(
         actor_critic, policy_optimizer, rollout_buf,
         n_epochs=args.n_epochs, minibatch_size=args.minibatch_size,
         clip_range=args.clip_range, ent_coef=args.ent_coef, vf_coef=args.vf_coef,
-        max_grad_norm=args.max_grad_norm,
+        max_grad_norm=args.max_grad_norm, return_normalizer=return_normalizer,
     )
+    soft_update_(target_actor_critic, actor_critic, args.critic_ema_decay)
     active_sum = rollout_buf["active_mask"].sum().clamp(min=1).item()
     mean_reward = (rollout_buf["rewards"] * rollout_buf["active_mask"]).sum().item() / active_sum
     return stats, mean_reward
@@ -116,6 +121,14 @@ def train(args):
     actor_critic = ActorCritic(
         state_dim=wm_config.n_embd, n_actions=wm_config.act_vocab_size, hidden_dim=args.hidden_dim
     ).to(device)
+
+    # critico-alvo suavizado por EMA + normalizacao de advantage por percentil
+    # de retorno (DreamerV3) -- ver modules.py::soft_update_/ReturnNormalizer.
+    target_actor_critic = copy.deepcopy(actor_critic)
+    target_actor_critic.eval()
+    for p in target_actor_critic.parameters():
+        p.requires_grad_(False)
+    return_normalizer = ReturnNormalizer(decay=args.return_norm_decay).to(device)
 
     wm_optimizer = world_model.configure_optimizers(weight_decay=args.wm_weight_decay, learning_rate=args.wm_lr)
     policy_optimizer = torch.optim.Adam(actor_critic.parameters(), lr=args.policy_lr)
@@ -180,7 +193,7 @@ def train(args):
         n_bench_policy = 5
         start = time.time()
         for _ in range(n_bench_policy):
-            policy_update_step(world_model, actor_critic, policy_optimizer, buffer, args, device)
+            policy_update_step(world_model, actor_critic, target_actor_critic, return_normalizer, policy_optimizer, buffer, args, device)
         policy_elapsed = time.time() - start
         print(f"Politica   : {n_bench_policy} updates de PPO em {policy_elapsed:.2f}s -> {n_bench_policy / policy_elapsed:.2f} updates/s")
         return
@@ -197,6 +210,12 @@ def train(args):
         wm_optimizer.load_state_dict(ckpt["wm_optimizer_state_dict"])
         actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
         policy_optimizer.load_state_dict(ckpt["policy_optimizer_state_dict"])
+        if "target_actor_critic_state_dict" in ckpt:
+            target_actor_critic.load_state_dict(ckpt["target_actor_critic_state_dict"])
+        else:
+            target_actor_critic.load_state_dict(actor_critic.state_dict())
+        if "return_normalizer_state_dict" in ckpt:
+            return_normalizer.load_state_dict(ckpt["return_normalizer_state_dict"])
         start_cycle = ckpt["cycle"] + 1
         best_eval_reward = ckpt.get("best_eval_reward", float("-inf"))
         print(f"Continuando do ciclo {start_cycle} | melhor eval: {best_eval_reward:.4f}")
@@ -229,7 +248,7 @@ def train(args):
         ]
 
         policy_results = [
-            policy_update_step(world_model, actor_critic, policy_optimizer, buffer, args, device)
+            policy_update_step(world_model, actor_critic, target_actor_critic, return_normalizer, policy_optimizer, buffer, args, device)
             for _ in range(args.policy_updates_per_cycle)
         ]
         policy_stats = [r[0] for r in policy_results]
@@ -309,6 +328,8 @@ def train(args):
                 "wm_optimizer_state_dict": wm_optimizer.state_dict(),
                 "actor_critic_state_dict": actor_critic.state_dict(),
                 "policy_optimizer_state_dict": policy_optimizer.state_dict(),
+                "target_actor_critic_state_dict": target_actor_critic.state_dict(),
+                "return_normalizer_state_dict": return_normalizer.state_dict(),
                 "best_eval_reward": best_eval_reward,
             },
             ckpt_path,
@@ -349,6 +370,8 @@ if __name__ == "__main__":
     p.add_argument("--ent_coef", type=float, default=0.01)
     p.add_argument("--vf_coef", type=float, default=0.05, help="default menor que train_dream.py (0.5) -- diagnostico de colapso de entropia no run original ja motivou essa mudanca (ver techreport.tex), reaproveitado aqui de train_real_latent.py/train_real_dreamer.py")
     p.add_argument("--max_grad_norm", type=float, default=0.5)
+    p.add_argument("--critic_ema_decay", type=float, default=0.98, help="suavizacao do critico-alvo (modules.py::soft_update_)")
+    p.add_argument("--return_norm_decay", type=float, default=0.99, help="suavizacao EMA da faixa de percentil usada pra escalar advantage (modules.py::ReturnNormalizer)")
     p.add_argument("--n_epochs", type=int, default=10)
     p.add_argument("--minibatch_size", type=int, default=64)
     p.add_argument("--eval_every", type=int, default=50)

@@ -13,6 +13,7 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import argparse
+import copy
 import time
 import torch
 from torch.utils.data import DataLoader
@@ -20,7 +21,7 @@ from torchvision.utils import save_image, make_grid
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
 from models.dynamics.dataset import CarRacingTokenDataset, symlog_torch
-from models.policy.modules import ActorCritic
+from models.policy.modules import ActorCritic, ReturnNormalizer, soft_update_
 from models.policy.rollout import collect_rollout
 from models.encoder.board import Board
 
@@ -84,7 +85,7 @@ def save_policy_dream(world_model, vqvae, actor_critic, obs_ctx, act_ctx, save_p
     print("     done  :", dones)
 
 
-def ppo_update(actor_critic, optimizer, buffer, n_epochs, minibatch_size, clip_range, ent_coef, vf_coef, max_grad_norm):
+def ppo_update(actor_critic, optimizer, buffer, n_epochs, minibatch_size, clip_range, ent_coef, vf_coef, max_grad_norm, return_normalizer=None):
     H, B = buffer["actions"].shape
     states = buffer["states"].reshape(H * B, -1)
     actions = buffer["actions"].reshape(H * B)
@@ -93,11 +94,18 @@ def ppo_update(actor_critic, optimizer, buffer, n_epochs, minibatch_size, clip_r
     returns = buffer["returns"].reshape(H * B)
     active_mask = buffer["active_mask"].reshape(H * B)
 
-    # normaliza advantage so sobre os passos ativos
-    active_sum = active_mask.sum().clamp(min=1.0)
-    adv_mean = (advantages * active_mask).sum() / active_sum
-    adv_var = ((advantages - adv_mean) ** 2 * active_mask).sum() / active_sum
-    advantages = (advantages - adv_mean) / (adv_var.sqrt() + 1e-8)
+    if return_normalizer is not None:
+        # DreamerV3: so ESCALA (nao centraliza) por uma faixa de percentil dos
+        # retornos suavizada por EMA -- ver modules.py::ReturnNormalizer.
+        scale = return_normalizer.update_and_get_scale(returns, active_mask)
+        advantages = advantages / scale
+    else:
+        # z-score por minibatch (comportamento antigo, mantido pra chamadas
+        # que nao passam return_normalizer, ex.: smoke_test.py)
+        active_sum = active_mask.sum().clamp(min=1.0)
+        adv_mean = (advantages * active_mask).sum() / active_sum
+        adv_var = ((advantages - adv_mean) ** 2 * active_mask).sum() / active_sum
+        advantages = (advantages - adv_mean) / (adv_var.sqrt() + 1e-8)
 
     n = H * B
     totals = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
@@ -172,6 +180,15 @@ def train(args):
     ).to(device)
     optimizer = torch.optim.Adam(actor_critic.parameters(), lr=args.lr)
 
+    # critico-alvo suavizado por EMA (DreamerV3) -- copia de actor_critic so pra
+    # ler o VALOR (baseline do GAE/bootstrap) de forma mais estavel; a acao
+    # sempre vem do actor_critic sendo treinado (collect_rollout cuida disso).
+    target_actor_critic = copy.deepcopy(actor_critic)
+    target_actor_critic.eval()
+    for p in target_actor_critic.parameters():
+        p.requires_grad_(False)
+    return_normalizer = ReturnNormalizer(decay=args.return_norm_decay).to(device)
+
     seeds = seed_iterator(
         args.dataset_path, wm_config.context_len, args.batch_size, args.seed, args.seed_stride, args.num_workers, device
     )
@@ -205,6 +222,12 @@ def train(args):
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "target_actor_critic_state_dict" in ckpt:
+            target_actor_critic.load_state_dict(ckpt["target_actor_critic_state_dict"])
+        else:
+            target_actor_critic.load_state_dict(actor_critic.state_dict())
+        if "return_normalizer_state_dict" in ckpt:
+            return_normalizer.load_state_dict(ckpt["return_normalizer_state_dict"])
         start_update = ckpt["update"] + 1
         best_reward = ckpt.get("best_reward", float("-inf"))
         print(f"Continuando do update {start_update} | melhor reward: {best_reward:.4f}")
@@ -214,14 +237,18 @@ def train(args):
     print("\nIniciando treino de politica via imaginacao...")
     for update in range(start_update, args.updates):
         obs_ctx, act_ctx = next(seeds)
-        buffer = collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, args.horizon, args.gamma, args.gae_lambda)
+        buffer = collect_rollout(
+            world_model, actor_critic, obs_ctx, act_ctx, args.horizon, args.gamma, args.gae_lambda,
+            target_actor_critic=target_actor_critic,
+        )
 
         stats = ppo_update(
             actor_critic, optimizer, buffer,
             n_epochs=args.n_epochs, minibatch_size=args.minibatch_size,
             clip_range=args.clip_range, ent_coef=args.ent_coef, vf_coef=args.vf_coef,
-            max_grad_norm=args.max_grad_norm,
+            max_grad_norm=args.max_grad_norm, return_normalizer=return_normalizer,
         )
+        soft_update_(target_actor_critic, actor_critic, args.critic_ema_decay)
 
         active_sum = buffer["active_mask"].sum().clamp(min=1).item()
         mean_reward = (buffer["rewards"] * buffer["active_mask"]).sum().item() / active_sum
@@ -259,6 +286,8 @@ def train(args):
                 "update": update,
                 "actor_critic_state_dict": actor_critic.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "target_actor_critic_state_dict": target_actor_critic.state_dict(),
+                "return_normalizer_state_dict": return_normalizer.state_dict(),
                 "best_reward": best_reward,
             },
             ckpt_path,
@@ -288,6 +317,8 @@ if __name__ == "__main__":
     p.add_argument("--ent_coef", type=float, default=0.01)
     p.add_argument("--vf_coef", type=float, default=0.5)
     p.add_argument("--max_grad_norm", type=float, default=0.5)
+    p.add_argument("--critic_ema_decay", type=float, default=0.98, help="suavizacao do critico-alvo (modules.py::soft_update_) -- mais perto de 1.0 = alvo mais estavel, mais devagar pra acompanhar o critico sendo treinado")
+    p.add_argument("--return_norm_decay", type=float, default=0.99, help="suavizacao EMA da faixa de percentil usada pra escalar advantage (modules.py::ReturnNormalizer)")
     p.add_argument("--n_epochs", type=int, default=10)
     p.add_argument("--minibatch_size", type=int, default=64)
     p.add_argument("--viz_every", type=int, default=20)

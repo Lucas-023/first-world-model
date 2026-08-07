@@ -5,11 +5,13 @@ Ver a nota em WorldModel.encode_state: reward/done de uma acao so aparecem na
 chamada de encode_state SEGUINTE, depois que a acao entra na janela
 deslizante. Por isso o buffer de reward/done coletado aqui e deslocado em 1
 passo em relacao a state/action/value -- reward_t (o reward atribuido a
-action_t) vem de reward_pred_{t+1}, nao de reward_pred_t.
+action_t) vem de reward_logits_{t+1}, nao de reward_logits_t.
 """
 
 import torch
 from torch.amp import autocast
+
+REWARD_LOOKUP = torch.tensor([-1.0, 0.0, 1.0])  # classe {neg,neutro,pos} -> escalar
 
 
 def compute_active_mask(dones):
@@ -69,13 +71,14 @@ def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=
     device = obs_ctx.device
     device_type = device.type
     critic = target_actor_critic if target_actor_critic is not None else actor_critic
+    reward_lookup = REWARD_LOOKUP.to(device)
 
     states, actions, log_probs, values = [], [], [], []
-    reward_pred_list, done_logits_list = [], []
+    reward_logits_list, done_logits_list = [], []
 
     with autocast(device_type=device_type):
         for _ in range(horizon):
-            state_t, reward_pred_t, done_logits_t = world_model.encode_state(obs_ctx, act_ctx)
+            state_t, reward_logits_t, done_logits_t = world_model.encode_state(obs_ctx, act_ctx)
             action_t, log_prob_t, _, _ = actor_critic.act(state_t)
             _, value_t = critic.forward(state_t)
             next_frame, _, _ = world_model.imagine_next_frame(obs_ctx, act_ctx, action_t)
@@ -84,21 +87,23 @@ def collect_rollout(world_model, actor_critic, obs_ctx, act_ctx, horizon, gamma=
             actions.append(action_t)
             log_probs.append(log_prob_t.float())
             values.append(value_t.float())
-            reward_pred_list.append(reward_pred_t.float())
+            reward_logits_list.append(reward_logits_t)
             done_logits_list.append(done_logits_t)
 
             obs_ctx = torch.cat([obs_ctx[:, 1:], next_frame.unsqueeze(1)], dim=1)
             act_ctx = torch.cat([act_ctx[:, 1:], action_t.unsqueeze(1)], dim=1)
 
         # chamada extra: reward/done de action_{H-1} + bootstrap value de s_H
-        state_H, reward_pred_H, done_logits_H = world_model.encode_state(obs_ctx, act_ctx)
+        state_H, reward_logits_H, done_logits_H = world_model.encode_state(obs_ctx, act_ctx)
         _, bootstrap_value = critic.forward(state_H)
         bootstrap_value = bootstrap_value.float()
-    reward_pred_list.append(reward_pred_H.float())
+    reward_logits_list.append(reward_logits_H)
     done_logits_list.append(done_logits_H)
 
     horizon_ = len(actions)
-    rewards = torch.stack([reward_pred_list[t + 1] for t in range(horizon_)])
+    rewards = torch.stack([
+        reward_lookup[reward_logits_list[t + 1].argmax(dim=-1)] for t in range(horizon_)
+    ])
     dones = torch.stack([
         done_logits_list[t + 1].argmax(dim=-1) for t in range(horizon_)
     ]).float()

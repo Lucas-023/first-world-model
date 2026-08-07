@@ -50,8 +50,8 @@ def soft_update_(target, source, decay):
     target = decay*target + (1-decay)*source, no lugar de copiar o peso
     inteiro de uma vez. Usado pra estabilizar os alvos de valor (values do
     rollout/bootstrap) contra a rede que esta sendo atualizada a cada passo
-    de gradiente -- ver techreport.tex, secao de proximos passos apos o fix
-    de symlog no value_loss."""
+    de gradiente -- ver techreport.tex, secao de estabilizadores do
+    DreamerV3/IRIS."""
     for tp, sp in zip(target.parameters(), source.parameters()):
         tp.data.mul_(decay).add_(sp.data, alpha=1 - decay)
 

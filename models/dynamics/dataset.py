@@ -5,7 +5,7 @@ Cada janela devolve:
     obs_ctx      : (context_len, 64)
     act_ctx      : (context_len,)
     obs_target   : (64,)
-    reward_target: ()  float32, reward real transformado por symlog
+    reward_class : ()  em {0,1,2} = {neg, neutro, pos}
     done_target  : ()  em {0,1}
 """
 
@@ -17,33 +17,12 @@ import torch
 from torch.utils.data import Dataset
 
 
-def symlog(rewards):
-    """Reward continuo -> alvo de regressao em escala symlog:
-    sign(x)*log(1+|x|). Comprime magnitude preservando o sinal, igual
-    DreamerV3 -- estabiliza a regressao mesmo com rewards de escalas bem
-    diferentes (ex.: -100 ao sair da pista vs. +0.1 por passo em pista).
-    Unica fonte de verdade dessa conversao -- reaproveitada por
-    models/policy/online_buffer.py pra garantir que o replay buffer online
-    rotule reward exatamente como o dataset offline sempre rotulou."""
-    return (np.sign(rewards) * np.log1p(np.abs(rewards))).astype(np.float32)
-
-
-def symexp(y):
-    """Inversa de symlog, em torch: sign(y)*(exp(|y|)-1). Usada pelo
-    WorldModel (gptdynamics.py) pra converter a predicao da cabeca de reward
-    (que vive em escala symlog, a mesma do alvo de treino) de volta pra
-    escala real de reward antes de devolver pra quem consome (rollout.py,
-    scripts de avaliacao/visualizacao)."""
-    return torch.sign(y) * torch.expm1(torch.abs(y))
-
-
-def symlog_torch(x):
-    """Mesma transformacao de symlog() acima, em torch e com autograd --
-    usada em train_dream.py pra comprimir o alvo (returns) e a predicao
-    (values) da funcao de valor do PPO antes do MSE, evitando que a escala
-    real do reward (dezenas a centenas) infle value_loss. symlog() (numpy)
-    nao serve aqui porque quebra o grafo de gradiente de `values`."""
-    return torch.sign(x) * torch.log1p(torch.abs(x))
+def reward_to_class(rewards):
+    """Reward continuo -> classe {0,1,2} = {neg,neutro,pos}. Unica fonte de
+    verdade dessa conversao -- reaproveitada por models/policy/online_buffer.py
+    pra garantir que o replay buffer online rotule reward exatamente como o
+    dataset offline sempre rotulou."""
+    return (np.sign(rewards) + 1).astype(np.int64)
 
 
 class CarRacingTokenDataset(Dataset):
@@ -101,7 +80,7 @@ class CarRacingTokenDataset(Dataset):
             actions = d["actions"].astype(np.int64)      # (T,)
             dones = d["dones"].astype(np.int64)          # (T,)
             rewards = d["rewards"].astype(np.float32)    # (T,)
-            rewards_symlog = symlog(rewards)              # escala symlog
+            rewards_sign = reward_to_class(rewards)      # {0,1,2}
 
             T = tokens.shape[0]
             if T < context_len + 1:
@@ -111,7 +90,7 @@ class CarRacingTokenDataset(Dataset):
                 obs_ctx = tokens[i:i + context_len]                   # (context_len, 64)
                 act_ctx = actions[i:i + context_len]                  # (context_len,)
                 obs_target = tokens[i + context_len]                  # (64,)
-                reward_target = rewards_symlog[i + context_len]       # ()
+                reward_target = rewards_sign[i + context_len]         # ()
                 done_target = dones[i + context_len]                  # ()
                 self.chunks.append((obs_ctx, act_ctx, obs_target, reward_target, done_target))
 
@@ -126,7 +105,7 @@ class CarRacingTokenDataset(Dataset):
             torch.from_numpy(obs_ctx).long(),
             torch.from_numpy(act_ctx).long(),
             torch.from_numpy(obs_target).long(),
-            torch.tensor(reward_target, dtype=torch.float32),
+            torch.tensor(reward_target, dtype=torch.long),
             torch.tensor(done_target, dtype=torch.long),
         )
 

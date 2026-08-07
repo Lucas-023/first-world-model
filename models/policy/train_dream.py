@@ -20,10 +20,12 @@ from torch.utils.data import DataLoader
 from torchvision.utils import save_image, make_grid
 
 from models.dynamics.gptdynamics import WorldModel, WorldModelConfig
-from models.dynamics.dataset import CarRacingTokenDataset, symlog_torch
+from models.dynamics.dataset import CarRacingTokenDataset
 from models.policy.modules import ActorCritic, ReturnNormalizer, soft_update_
 from models.policy.rollout import collect_rollout
 from models.encoder.board import Board
+
+REWARD_LABEL = {0: "neg (-1)", 1: "neutro (0)", 2: "pos (+1)"}
 
 
 def load_world_model(ckpt_path, device):
@@ -64,10 +66,10 @@ def save_policy_dream(world_model, vqvae, actor_critic, obs_ctx, act_ctx, save_p
         for _ in range(n_frames):
             state, _, _ = world_model.encode_state(obs_ctx, act_ctx)
             action, _, _, _ = actor_critic.act(state)
-            next_frame, reward_pred, done_cls = world_model.imagine_next_frame(obs_ctx, act_ctx, action)
+            next_frame, reward_cls, done_cls = world_model.imagine_next_frame(obs_ctx, act_ctx, action)
 
             frames.append(next_frame)
-            rewards.append(reward_pred.item())
+            rewards.append(reward_cls.item())
             dones.append(done_cls.item())
 
             obs_ctx = torch.cat([obs_ctx[:, 1:], next_frame.unsqueeze(1)], dim=1)
@@ -81,7 +83,7 @@ def save_policy_dream(world_model, vqvae, actor_critic, obs_ctx, act_ctx, save_p
             board.log_image("policy_dream/frames", grid, step)
 
     print("  -> Sonho guiado pela politica (reward/done previstos):")
-    print("     reward:", [f"{r:.3f}" for r in rewards])
+    print("     reward:", [REWARD_LABEL[r] for r in rewards])
     print("     done  :", dones)
 
 
@@ -127,11 +129,7 @@ def ppo_update(actor_critic, optimizer, buffer, n_epochs, minibatch_size, clip_r
             surr1 = ratio * adv
             surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * adv
             policy_loss = -(torch.min(surr1, surr2) * mask).sum() / mask_sum
-            # symlog nos dois lados (nao em GAE/vantagem, so aqui): reward real
-            # (dezenas a centenas) faz `returns` variar muito mais do que na
-            # antiga escala de classificacao (+-1), o que inflava value_loss
-            # sem convergir -- ver techreport.tex, secao de regressao do valor.
-            value_loss = ((symlog_torch(values) - symlog_torch(returns[idx])) ** 2 * mask).sum() / mask_sum
+            value_loss = ((values - returns[idx]) ** 2 * mask).sum() / mask_sum
             entropy_bonus = (entropy * mask).sum() / mask_sum
 
             loss = policy_loss + vf_coef * value_loss - ent_coef * entropy_bonus

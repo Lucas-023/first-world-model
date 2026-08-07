@@ -63,7 +63,7 @@ def _collect_windows(files, file_order, context_len, horizon, n_windows):
         tokens = d["tokens"].astype(np.int64)
         actions = d["actions"].astype(np.int64)
         dones_raw = d["dones"].astype(np.int64)
-        rewards_raw = d["rewards"].astype(np.float32)  # escala real, nao classe
+        rewards_sign = (np.sign(d["rewards"].astype(np.float32)) + 1).astype(np.int64)
 
         T = tokens.shape[0]
         C = context_len
@@ -75,9 +75,9 @@ def _collect_windows(files, file_order, context_len, horizon, n_windows):
         act_ctx_list.append(actions[i:i + C])
         real_obs_list.append(tokens[i + C:i + C + horizon])
         real_act_list.append(actions[i + C:i + C + horizon])
-        real_rew_list.append(rewards_raw[i + C:i + C + horizon])
+        real_rew_list.append(rewards_sign[i + C:i + C + horizon])
         real_done_list.append(dones_raw[i + C:i + C + horizon])
-        persist_rew_list.append(rewards_raw[i + C - 1])
+        persist_rew_list.append(rewards_sign[i + C - 1])
         persist_done_list.append(dones_raw[i + C - 1])
 
     return (
@@ -100,8 +100,9 @@ def _run_chunk(model, device, obs_ctx_np, act_ctx_np, real_obs, real_act, real_r
     B = obs_ctx_np.shape[0]
     obs_correct = np.zeros(horizon)
     obs_total = np.zeros(horizon)
-    rew_abs_err = np.zeros(horizon)
+    rew_correct = np.zeros(horizon)
     done_correct = np.zeros(horizon)
+    reward_confusion = np.zeros((3, 3), dtype=np.int64)
     done_confusion = np.zeros((2, 2), dtype=np.int64)
 
     for s in range(horizon):
@@ -110,21 +111,22 @@ def _run_chunk(model, device, obs_ctx_np, act_ctx_np, real_obs, real_act, real_r
             next_obs, reward_pred, done_pred = model.imagine_next_frame(obs_ctx, act_ctx, act_token)
 
         next_obs_np = next_obs.cpu().numpy()
-        reward_pred_np = reward_pred.float().cpu().numpy()
+        reward_pred_np = reward_pred.cpu().numpy()
         done_pred_np = done_pred.cpu().numpy()
 
         obs_correct[s] += (next_obs_np == real_obs[:, s]).sum()
         obs_total[s] += real_obs[:, s].size
-        rew_abs_err[s] += np.abs(reward_pred_np - real_rew[:, s]).sum()
+        rew_correct[s] += (reward_pred_np == real_rew[:, s]).sum()
         done_correct[s] += (done_pred_np == real_done[:, s]).sum()
 
         for b in range(B):
+            reward_confusion[real_rew[b, s], reward_pred_np[b]] += 1
             done_confusion[real_done[b, s], done_pred_np[b]] += 1
 
         obs_ctx = torch.cat([obs_ctx[:, 1:], next_obs.unsqueeze(1)], dim=1)
         act_ctx = torch.cat([act_ctx[:, 1:], act_token.unsqueeze(1)], dim=1)
 
-    return obs_correct, obs_total, rew_abs_err, done_correct, done_confusion
+    return obs_correct, obs_total, rew_correct, done_correct, reward_confusion, done_confusion
 
 
 def evaluate_rollout(model, config, files, device, horizon, n_windows, seed, eval_batch_size=64):
@@ -145,15 +147,16 @@ def evaluate_rollout(model, config, files, device, horizon, n_windows, seed, eva
 
     obs_correct = np.zeros(horizon)
     obs_total = np.zeros(horizon)
-    rew_abs_err = np.zeros(horizon)
+    rew_correct = np.zeros(horizon)
     done_correct = np.zeros(horizon)
-    persist_rew_abs_err = np.zeros(horizon)
+    persist_rew_correct = np.zeros(horizon)
     persist_done_correct = np.zeros(horizon)
+    reward_confusion = np.zeros((3, 3), dtype=np.int64)
     done_confusion = np.zeros((2, 2), dtype=np.int64)
 
     for start in range(0, B, eval_batch_size):
         end = min(start + eval_batch_size, B)
-        c_obs_correct, c_obs_total, c_rew_abs_err, c_done_correct, c_done_conf = _run_chunk(
+        c_obs_correct, c_obs_total, c_rew_correct, c_done_correct, c_rew_conf, c_done_conf = _run_chunk(
             model, device,
             obs_ctx[start:end], act_ctx[start:end],
             real_obs[start:end], real_act[start:end], real_rew[start:end], real_done[start:end],
@@ -161,8 +164,9 @@ def evaluate_rollout(model, config, files, device, horizon, n_windows, seed, eva
         )
         obs_correct += c_obs_correct
         obs_total += c_obs_total
-        rew_abs_err += c_rew_abs_err
+        rew_correct += c_rew_correct
         done_correct += c_done_correct
+        reward_confusion += c_rew_conf
         done_confusion += c_done_conf
 
         chunk_rew = real_rew[start:end]
@@ -170,15 +174,16 @@ def evaluate_rollout(model, config, files, device, horizon, n_windows, seed, eva
         chunk_persist_rew = persist_rew[start:end]
         chunk_persist_done = persist_done[start:end]
         for s in range(horizon):
-            persist_rew_abs_err[s] += np.abs(chunk_persist_rew - chunk_rew[:, s]).sum()
+            persist_rew_correct[s] += (chunk_persist_rew == chunk_rew[:, s]).sum()
             persist_done_correct[s] += (chunk_persist_done == chunk_done[:, s]).sum()
 
     return {
         "obs_acc": obs_correct / np.maximum(obs_total, 1),
-        "rew_mae": rew_abs_err / max(B, 1),
+        "rew_acc": rew_correct / max(B, 1),
         "done_acc": done_correct / max(B, 1),
-        "persist_rew_mae": persist_rew_abs_err / max(B, 1),
+        "persist_rew_acc": persist_rew_correct / max(B, 1),
         "persist_done_acc": persist_done_correct / max(B, 1),
+        "reward_confusion": reward_confusion,
         "done_confusion": done_confusion,
         "n_windows": B,
     }
@@ -210,15 +215,15 @@ def main():
     result = evaluate_rollout(model, config, files, args.device, args.horizon, args.n_windows, args.seed, args.eval_batch_size)
 
     emit(f"\n{result['n_windows']} janelas avaliadas.\n")
-    emit(f"{'passo':>5} | {'obs_acc':>8} | {'rew_mae':>8} | {'rew_mae_persist':>15} | {'done_acc':>8} | {'done_persist':>12}")
+    emit(f"{'passo':>5} | {'obs_acc':>8} | {'rew_acc':>8} | {'rew_persist':>11} | {'done_acc':>8} | {'done_persist':>12}")
     for s in range(args.horizon):
         emit(
-            f"{s + 1:>5} | {result['obs_acc'][s]:>8.3f} | {result['rew_mae'][s]:>8.3f} | "
-            f"{result['persist_rew_mae'][s]:>15.3f} | {result['done_acc'][s]:>8.3f} | {result['persist_done_acc'][s]:>12.3f}"
+            f"{s + 1:>5} | {result['obs_acc'][s]:>8.3f} | {result['rew_acc'][s]:>8.3f} | "
+            f"{result['persist_rew_acc'][s]:>11.3f} | {result['done_acc'][s]:>8.3f} | {result['persist_done_acc'][s]:>12.3f}"
         )
-    emit("\nrew_mae = erro absoluto medio do reward previsto (escala real), rew_mae_persist = baseline de "
-         "repetir o ultimo reward real antes do horizonte -- rew_mae menor que rew_mae_persist indica sinal util.")
 
+    emit("\nMatriz de confusao de reward (linha=real, coluna=previsto; 0=neg,1=neutro,2=pos):")
+    emit(str(result["reward_confusion"]))
     emit("\nMatriz de confusao de done (linha=real, coluna=previsto; 0/1):")
     emit(str(result["done_confusion"]))
 

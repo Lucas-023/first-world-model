@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from collections import deque
 
-from models.dynamics.dataset import symlog
+from models.dynamics.dataset import reward_to_class
 
 
 class OnlineReplayBuffer:
@@ -44,14 +44,14 @@ class OnlineReplayBuffer:
         actions = data["actions"].astype(np.int64)
         dones = data["dones"].astype(np.int64)
         rewards = data["rewards"].astype(np.float32)
-        rewards_symlog = symlog(rewards)
+        rewards_class = reward_to_class(rewards)
 
         T = tokens.shape[0]
         eid = self._next_id
         self._next_id += 1
         self.episodes_by_id[eid] = {
             "tokens": tokens, "actions": actions, "dones": dones,
-            "rewards_symlog": rewards_symlog,
+            "rewards_class": rewards_class,
         }
         self.episode_order.append(eid)
         self.total_steps += T
@@ -100,14 +100,14 @@ class OnlineReplayBuffer:
             obs_ctx_b.append(ep["tokens"][start:end])
             act_ctx_b.append(ep["actions"][start:end])
             obs_tgt_b.append(ep["tokens"][end])
-            rew_tgt_b.append(ep["rewards_symlog"][end])
+            rew_tgt_b.append(ep["rewards_class"][end])
             done_tgt_b.append(ep["dones"][end])
 
         return (
             torch.from_numpy(np.stack(obs_ctx_b)).long().to(device),
             torch.from_numpy(np.stack(act_ctx_b)).long().to(device),
             torch.from_numpy(np.stack(obs_tgt_b)).long().to(device),
-            torch.tensor(rew_tgt_b, dtype=torch.float32, device=device),
+            torch.tensor(rew_tgt_b, dtype=torch.long, device=device),
             torch.tensor(done_tgt_b, dtype=torch.long, device=device),
         )
 

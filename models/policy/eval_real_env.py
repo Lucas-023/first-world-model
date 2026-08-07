@@ -148,13 +148,19 @@ def frame_to_tensor(frame, device):
 
 
 def load_world_model(ckpt_path, device):
+    """Aceita tanto checkpoints de traingpt.py (chave "model_state_dict", com
+    "config" embutido) quanto de train_online.py (chave
+    "world_model_state_dict", SEM "config" -- o loop online nunca muda
+    arquitetura, so pesos, entao os defaults de WorldModelConfig() sao
+    exatamente os mesmos hiperparametros usados no treino nos dois casos)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     cfg = ckpt.get("config", {})
     init_keys = {"obs_vocab_size", "act_vocab_size", "img_tokens", "context_len", "n_embd", "n_head", "n_layer", "dropout"}
     cfg = {k: v for k, v in cfg.items() if k in init_keys}
     config = WorldModelConfig(**cfg) if cfg else WorldModelConfig()
     model = WorldModel(config).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt["world_model_state_dict"]
+    model.load_state_dict(state_dict)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)

@@ -36,6 +36,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import argparse
 import copy
 import time
+from collections import deque
 import torch
 from torch.amp import autocast, GradScaler
 
@@ -97,6 +98,23 @@ def policy_update_step(world_model, actor_critic, target_actor_critic, return_no
     active_sum = rollout_buf["active_mask"].sum().clamp(min=1).item()
     mean_reward = (rollout_buf["rewards"] * rollout_buf["active_mask"]).sum().item() / active_sum
     return stats, mean_reward
+
+
+def _full_checkpoint_dict(cycle, world_model, wm_optimizer, actor_critic, policy_optimizer,
+                           target_actor_critic, return_normalizer, best_eval_reward):
+    """Estado completo (pesos + otimizadores + estabilizadores) -- usado tanto
+    pro checkpoint de resume (online_ckpt.pt) quanto pro melhor (online_best.pt),
+    pra retomar de qualquer um dos dois sem reiniciar o momentum do Adam."""
+    return {
+        "cycle": cycle,
+        "world_model_state_dict": world_model.state_dict(),
+        "wm_optimizer_state_dict": wm_optimizer.state_dict(),
+        "actor_critic_state_dict": actor_critic.state_dict(),
+        "policy_optimizer_state_dict": policy_optimizer.state_dict(),
+        "target_actor_critic_state_dict": target_actor_critic.state_dict(),
+        "return_normalizer_state_dict": return_normalizer.state_dict(),
+        "best_eval_reward": best_eval_reward,
+    }
 
 
 def train(args):
@@ -219,11 +237,14 @@ def train(args):
         if "return_normalizer_state_dict" in ckpt:
             return_normalizer.load_state_dict(ckpt["return_normalizer_state_dict"])
         start_cycle = ckpt["cycle"] + 1
-        best_eval_reward = ckpt.get("best_eval_reward", float("-inf"))
-        print(f"Continuando do ciclo {start_cycle} | melhor eval: {best_eval_reward:.4f}")
+        best_eval_reward = float("-inf") if args.reset_best else ckpt.get("best_eval_reward", float("-inf"))
+        print(f"Continuando do ciclo {start_cycle} | melhor eval: {best_eval_reward:.4f}"
+              + (" (resetado com --reset_best)" if args.reset_best else ""))
         print("Buffer de replay NAO e persistido -- comeca vazio, reenche com interacao real.")
     else:
         print("Iniciando do zero.")
+
+    recent_evals = deque(maxlen=max(1, args.best_eval_window))
 
     if start_cycle >= args.cycles:
         print(
@@ -290,18 +311,24 @@ def train(args):
             print(f"  [Eval seeds fixas] reward_medio {eval_reward:.2f} ({args.eval_episodes} episodios)")
             board.log_scalar("eval/mean_reward", eval_reward, cycle)
 
-            if eval_reward > best_eval_reward:
-                best_eval_reward = eval_reward
+            # Media movel das ultimas --best_eval_window avaliacoes como criterio de
+            # "melhor" -- um unico eval_reward e o maximo de dezenas/centenas de
+            # sorteios ruidosos ao longo do treino (winner's-curse: ver
+            # docs/DECISIONS.md "Council consultation" -- o pico historico de 747
+            # ficou ~2 desvios acima da media real do processo). best_eval_window=1
+            # (default) preserva o comportamento antigo.
+            recent_evals.append(eval_reward)
+            smoothed_eval_reward = sum(recent_evals) / len(recent_evals)
+            if len(recent_evals) == recent_evals.maxlen and smoothed_eval_reward > best_eval_reward:
+                best_eval_reward = smoothed_eval_reward
                 torch.save(
-                    {
-                        "cycle": cycle,
-                        "world_model_state_dict": world_model.state_dict(),
-                        "actor_critic_state_dict": actor_critic.state_dict(),
-                        "best_eval_reward": best_eval_reward,
-                    },
+                    _full_checkpoint_dict(
+                        cycle, world_model, wm_optimizer, actor_critic, policy_optimizer,
+                        target_actor_critic, return_normalizer, best_eval_reward,
+                    ),
                     best_path,
                 )
-                print(f"  -> Novo melhor checkpoint (eval determinístico: {best_eval_reward:.2f})")
+                print(f"  -> Novo melhor checkpoint (eval suavizado: {best_eval_reward:.2f}, janela={len(recent_evals)})")
 
         if args.viz_every > 0 and cycle % args.viz_every == 0:
             try:
@@ -324,16 +351,10 @@ def train(args):
             )
 
         torch.save(
-            {
-                "cycle": cycle,
-                "world_model_state_dict": world_model.state_dict(),
-                "wm_optimizer_state_dict": wm_optimizer.state_dict(),
-                "actor_critic_state_dict": actor_critic.state_dict(),
-                "policy_optimizer_state_dict": policy_optimizer.state_dict(),
-                "target_actor_critic_state_dict": target_actor_critic.state_dict(),
-                "return_normalizer_state_dict": return_normalizer.state_dict(),
-                "best_eval_reward": best_eval_reward,
-            },
+            _full_checkpoint_dict(
+                cycle, world_model, wm_optimizer, actor_critic, policy_optimizer,
+                target_actor_critic, return_normalizer, best_eval_reward,
+            ),
             ckpt_path,
         )
 
@@ -378,6 +399,8 @@ if __name__ == "__main__":
     p.add_argument("--minibatch_size", type=int, default=64)
     p.add_argument("--eval_every", type=int, default=50)
     p.add_argument("--eval_episodes", type=int, default=10)
+    p.add_argument("--best_eval_window", type=int, default=1, help="tamanho da media movel de eval/mean_reward usada pra escolher 'melhor checkpoint' -- 1 (default) preserva o comportamento antigo (ponto unico); >1 reduz a inflacao por sorte de amostragem (ver docs/DECISIONS.md 'Council consultation': o pico de 747 ficou ~2 desvios acima da media real do processo)")
+    p.add_argument("--reset_best", action="store_true", help="ao retomar de um checkpoint de outro save_dir (ex.: copiado de outro experimento), nao herdar o best_eval_reward dele -- sem isso, um resume so consegue salvar um novo 'best' se superar a marca do experimento de origem, o que pode nunca acontecer e mascarar silenciosamente que o mecanismo de best parou de funcionar")
     p.add_argument("--ckpt_every", type=int, default=100)
     p.add_argument("--viz_every", type=int, default=20)
     p.add_argument("--viz_frames", type=int, default=20)

@@ -207,9 +207,11 @@ def train(args):
         print(f"Retomando de: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         world_model.load_state_dict(ckpt["world_model_state_dict"])
-        wm_optimizer.load_state_dict(ckpt["wm_optimizer_state_dict"])
         actor_critic.load_state_dict(ckpt["actor_critic_state_dict"])
-        policy_optimizer.load_state_dict(ckpt["policy_optimizer_state_dict"])
+        if "wm_optimizer_state_dict" in ckpt:
+            wm_optimizer.load_state_dict(ckpt["wm_optimizer_state_dict"])
+        if "policy_optimizer_state_dict" in ckpt:
+            policy_optimizer.load_state_dict(ckpt["policy_optimizer_state_dict"])
         if "target_actor_critic_state_dict" in ckpt:
             target_actor_critic.load_state_dict(ckpt["target_actor_critic_state_dict"])
         else:

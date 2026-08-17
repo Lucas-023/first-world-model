@@ -38,8 +38,8 @@
 \title[Mundos Imaginados]{Mundos Imaginados}
 \subtitle{Aprendendo a Dinâmica do \texttt{CarRacing} com Tokens Visuais e um GPT Causal}
 \author{Lucas Barcelos}
-\institute{Relatório Técnico Parcial}
-\date{\today}
+\institute{IMPA Tech / Visgraf}
+\date{19 de agosto de 2026}
 
 % Atalho para nós do diagrama
 \tikzset{
@@ -310,52 +310,108 @@
 
   \medskip
   {\footnotesize Topo: frame original \quad$\vert$\quad Base: reconstrução do VQ-VAE
-  (após 400 épocas). A geometria da pista e a posição do carro são
-  preservadas com fidelidade.}
+  (época 84, melhor \texttt{val\_loss}). A geometria da pista e a posição do
+  carro são preservadas; detalhes finos ainda perdem nitidez.}
 
   \vfill
   {\scriptsize\textcolor{gray}{Treino: MSE + VQ commitment \textperiodcentered{} AdamW (lr $10^{-4}$) \textperiodcentered{}
-  batch 128 \textperiodcentered{} 400 épocas \textperiodcentered{} AMP \textperiodcentered{} grad clip 1.0}}
+  batch 128 \textperiodcentered{} orçamento de 400 épocas, parou em 84 \textperiodcentered{} AMP \textperiodcentered{} grad clip 1.0}}
 \end{frame}
 
 \begin{frame}{VQ-VAE --- Uso do Codebook}
-  \begin{columns}[c]
-    \begin{column}{0.6\textwidth}
-      \centering
-      \includegraphics[width=\textwidth]{slides_assets/codebook_usage.png}
-    \end{column}
-    \begin{column}{0.38\textwidth}
-      \small
-      \begin{block}{Por que medir?}
-        \footnotesize
-        Um codebook saudável usa \textbf{muitos dos 512 códigos} e evita
-        \emph{codebook collapse} (poucos códigos dominando). Métricas:
-        \begin{itemize}
-          \item códigos ativos / 512
-          \item \textbf{perplexity} $=e^{H(p)}$
-          \item \% coberto pelo top-10
-        \end{itemize}
-      \end{block}
-    \end{column}
-  \end{columns}
+  \begin{block}{Por que medir?}
+    \small
+    Um codebook saudável usa \textbf{muitos dos 512 códigos} e evita
+    \emph{codebook collapse} (poucos códigos concentrando quase todo o uso).
+    Isso se mede por:
+    \begin{itemize}
+      \item códigos ativos / 512
+      \item \textbf{perplexity} $=e^{H(p)}$ --- quanto mais perto de 512, mais
+            uniforme o uso
+      \item \% dos tokens coberto pelos 10 códigos mais frequentes
+    \end{itemize}
+  \end{block}
+
+  \begin{block}{Como medir}
+    \small
+    \texttt{results/plot\_codebook\_usage.py} calcula essas três métricas
+    direto de \texttt{dataset\_tokens/} (ou codificando frames crus com
+    \texttt{--encode}).
+  \end{block}
+\end{frame}
+
+% =====================================================================
+\section{Primeira Versão --- GPT Image}
+
+\begin{frame}{GPT Image --- Primeira Versão do Modelo de Dinâmica}
+  \small\texttt{models/dynamics/gptimage.py}, \texttt{trainimage.py}
+  \medskip
+
+  Antes de fechar o world model como MDP completo, a primeira versão só
+  validava a parte mais arriscada: \textbf{um Transformer causal consegue
+  prever os tokens visuais do próximo frame?}
+
+  \bigskip
+  \begin{block}{O que essa versão fazia}
+    \begin{itemize}\small
+      \item Mesmo layout de sequência (19 frames de contexto, blocos de 65
+            tokens = 64 visuais + 1 ação).
+      \item \textbf{Só previa os 64 tokens do próximo frame} --- sem cabeça
+            de recompensa ou de done.
+      \item Objetivo: isolar e validar a dinâmica visual antes de somar a
+            complexidade de recompensa/done/RL.
+    \end{itemize}
+  \end{block}
+
+  \bigskip
+  \small Depois de validado, essa base virou \texttt{gptdynamics.py}: mesmo
+  esqueleto, mais as cabeças de recompensa e done (próximos slides).
+\end{frame}
+
+\begin{frame}{GPT Image --- Resultados da Primeira Versão}
+  \centering
+  \includegraphics[width=0.92\textwidth]{slides_assets/gptimage_era/comparison.png}
 
   \smallskip
-  {\scriptsize\textcolor{red!70!black}{\textbf{Figura ilustrativa (EXEMPLO).}}
-  \textcolor{gray}{Gerar os números reais com
-  \texttt{results/plot\_codebook\_usage.py} sobre o dataset tokenizado / VQ-VAE
-  treinado, e recompilar.}}
+  {\footnotesize Topo: sonho (só tokens visuais) \quad$\vert$\quad Base: real.}
+
+  \medskip
+  \begin{columns}[c]
+    \begin{column}{0.5\textwidth}
+      \centering
+      \footnotesize
+      \begin{tabular}{ll}
+        \toprule
+        Métrica (rollout 20f) & Valor \\
+        \midrule
+        PSNR inicial (f.\,0) & $40{,}0$ dB \\
+        PSNR final (f.\,19)  & $24{,}9$ dB \\
+        PSNR médio           & $30{,}9$ dB \\
+        \bottomrule
+      \end{tabular}
+    \end{column}
+    \begin{column}{0.46\textwidth}
+      \footnotesize Fidelidade visual alta confirmou que a abordagem
+      (VQ-VAE + Transformer causal) funcionava --- justificou investir na
+      versão completa com recompensa/done.
+    \end{column}
+  \end{columns}
 \end{frame}
 
 % =====================================================================
 \section{Modelo de Dinâmica --- GPT}
 
 \begin{frame}{GPT Dynamics --- Layout de Sequência}
-  \small\texttt{models/dynamics/gptimage.py}, \texttt{trainimage.py}
+  \small\texttt{models/dynamics/gptdynamics.py}, \texttt{traingpt.py}
   \medskip
 
-  O modelo prevê os \textbf{64 tokens} do próximo frame dado um contexto de
-  \textbf{19 frames} + a ação a executar. Cada frame é um \emph{bloco de 65
-  tokens}:
+  Evolução direta da primeira versão (\texttt{gptimage.py}): mesmo esqueleto
+  de sequência, agora com recompensa e done.
+  \medskip
+
+  O modelo prevê os \textbf{64 tokens} do próximo frame \emph{e} a
+  recompensa/done da transição, dado um contexto de \textbf{19 frames} + a
+  ação a executar. Cada frame é um \emph{bloco de 65 tokens}:
   \medskip
 
   \[
@@ -369,6 +425,9 @@
       \item Sequência de entrada: $19 \times 65 = \mathbf{1235}$ tokens.
       \item \texttt{block\_size} máximo: $20 \times 65 = \mathbf{1300}$
             (contexto + bloco alvo).
+      \item A representação da \textbf{última posição do contexto} alimenta,
+            além da cabeça de tokens, uma cabeça de \textbf{recompensa}
+            (3 classes: neg/neutro/pos) e uma de \textbf{done} (2 classes).
     \end{itemize}
   \end{block}
 \end{frame}
@@ -407,8 +466,9 @@
   \end{tikzpicture}}
 
   \medskip
-  {\footnotesize O modelo é um \textbf{GPT}: prediz o próximo token do stream. Ao prever os
-  64 tokens do frame seguinte condiciona-se no contexto \emph{e} na ação $a$.}
+  {\scriptsize O modelo é um \textbf{GPT}: prediz o próximo token do stream, condicionado
+  no contexto \emph{e} na ação $a$. A mesma representação também alimenta
+  \texttt{head\_rewards} ($256\!\to\!3$) e \texttt{head\_dones} ($256\!\to\!2$).}
 \end{frame}
 
 \begin{frame}{GPT Dynamics --- Arquitetura e Treino}
@@ -427,7 +487,9 @@
           Transformer & 6 cam., 4 cab., $d_{ff}{=}1024$ \\
                        & GELU, \texttt{norm\_first} \\
           Máscara & causal (triangular) \\
-          Cabeça & $256 \to 512$ (tied) \\
+          Cabeça obs & $256 \to 512$ (tied) \\
+          Cabeça reward & $256 \to 3$ (neg/neutro/pos) \\
+          Cabeça done & $256 \to 2$ \\
           \bottomrule
         \end{tabular}
       \end{table}
@@ -441,11 +503,11 @@
           \toprule
           Hiperparâm. & Valor \\
           \midrule
-          Loss & cross-entropy (token) \\
+          Loss & CE token + CE reward + CE done \\
           Otimizador & AdamW, wd $0.01$ \\
           lr & $10^{-4}$ \\
           Batch & 32 \\
-          Épocas & 5000 \\
+          Épocas & orçamento 5000, parou em 18 \\
           Precisão & AMP \\
           Grad clip & 1.0 \\
           Contexto & 19 frames \\
@@ -464,7 +526,9 @@
   \medskip
 
   \begin{itemize}
-    \item Os 64 tokens do próximo frame são gerados \textbf{um a um}.
+    \item Os 64 tokens do próximo frame são gerados \textbf{um a um}; a classe
+          de \textbf{recompensa} e o \textbf{done} da transição saem no mesmo
+          passo (antes do primeiro token visual, via KV-cache).
     \item \textbf{Top-$k$ sampling} ($k=50$, temperatura $=1.0$) --- evita tokens
           de baixíssima probabilidade sem colapsar para \emph{greedy}.
     \item \textbf{Janela deslizante}: a cada frame gerado, descarta-se o mais
@@ -488,7 +552,7 @@
 \section{Resultados}
 
 \begin{frame}{Resultados --- Sonho vs.\ Real}
-  \small\texttt{models/dynamics/inferimage.py}
+  \small\texttt{models/dynamics/infergpt.py}
   \smallskip
 
   Seed de \textbf{19 frames} reais $\to$ modelo ``sonha'' \textbf{40 frames}
@@ -509,8 +573,8 @@
 
   \smallskip
   {\footnotesize Topo: \textbf{sonho} do modelo (rollout autorregressivo) \quad$\vert$\quad
-  Base: \textbf{real}. Frames amostrados de \texttt{dream\_from\_grid.gif} /
-  \texttt{real\_from\_grid.gif}.}
+  Base: \textbf{real}. Frames amostrados de \texttt{dream.gif} /
+  \texttt{real.gif} (\texttt{infergpt.py}).}
 
   \vfill
   {\scriptsize\textcolor{gray}{GIFs animados disponíveis em \texttt{results/dreams/} e
@@ -530,10 +594,10 @@
           \toprule
           Métrica (rollout 20f) & Valor \\
           \midrule
-          PSNR inicial (f.\,0)  & $40{,}0$ dB \\
-          PSNR final (f.\,19)   & $24{,}9$ dB \\
-          PSNR médio            & $30{,}9$ dB \\
-          Queda por frame       & $-0{,}72$ dB \\
+          PSNR inicial (f.\,0)  & $34{,}1$ dB \\
+          PSNR final (f.\,19)   & $22{,}0$ dB \\
+          PSNR médio            & $27{,}9$ dB \\
+          Queda por frame       & $-0{,}64$ dB \\
           \bottomrule
         \end{tabular}
       \end{table}
@@ -545,7 +609,7 @@
 
   \smallskip
   {\scriptsize\textcolor{gray}{PSNR calculado frame-a-frame entre
-  \texttt{dream\_from\_grid.gif} e \texttt{real\_from\_grid.gif}.}}
+  \texttt{dream.gif} e \texttt{real.gif} (\texttt{infergpt.py}).}}
 \end{frame}
 
 \begin{frame}{Resultados --- Análise}
@@ -557,10 +621,14 @@
   \end{block}
 
   \bigskip
-  \begin{block}{Sanidade quantitativa}
-    \textbf{Token accuracy} --- fração dos 64 tokens sonhados que coincidem
-    exatamente com os reais --- é reportada ao fim de cada execução da
-    inferência.
+  \begin{block}{Sanidade quantitativa (rollout de 20 frames, 1 episódio de teste)}
+    \begin{itemize}\small
+      \item \textbf{Token accuracy}: $33{,}1\%$ dos 64 tokens sonhados
+            coincidem exatamente com os reais (chance $\approx 0{,}2\%$
+            em 512 códigos).
+      \item \textbf{Acurácia de recompensa} (3 classes): $72{,}5\%$
+            (chance $= 33\%$).
+    \end{itemize}
   \end{block}
 
   \bigskip
@@ -572,24 +640,29 @@
 \section{Escolhas de Design}
 
 \begin{frame}{Resumo das Escolhas de Design}
-  \small
+  \footnotesize
   \begin{table}
     \begin{tabular}{@{}p{4.3cm} p{7.6cm}@{}}
       \toprule
       \textbf{Decisão} & \textbf{Motivação} \\
       \midrule
       Discretização VQ-VAE &
-        Tokens simplificam a previsão do GPT (cross-entropy vs.\ regressão). \\[3pt]
+        Tokens simplificam a previsão do GPT (cross-entropy vs.\ regressão);
+        segue IRIS (Micheli et al., 2023) --- VQ-VAE + Transformer, diferente
+        do VAE contínuo + RNN de Ha \& Schmidhuber (2018). \\[2pt]
       Atenção só em baixa resolução &
-        Reduz custo quadrático mantendo capacidade global ($8{\times}8$, $16{\times}16$). \\[3pt]
+        Reduz custo quadrático mantendo capacidade global ($8{\times}8$, $16{\times}16$). \\[2pt]
       Pesos amarrados (tied) &
-        Regularização padrão; reduz parâmetros sem perder expressividade. \\[3pt]
+        Regularização padrão; reduz parâmetros sem perder expressividade. \\[2pt]
       $\varepsilon$-schedule crescente &
-        Cobre estados raros sem sacrificar a qualidade média do dataset. \\[3pt]
+        Cobre estados raros sem sacrificar a qualidade média do dataset. \\[2pt]
       Teacher forcing &
-        Estabilidade de gradiente; evita BPTT longo. \\[3pt]
+        Estabilidade de gradiente; evita BPTT longo. \\[2pt]
       Top-$k$ sampling &
-        Evita tokens improváveis sem colapsar para greedy. \\
+        Evita tokens improváveis sem colapsar para greedy. \\[2pt]
+      Reward/done como classificação &
+        Cross-entropy sobre classes discretas (estilo IRIS), não regressão
+        symlog (estilo DreamerV3). \\
       \bottomrule
     \end{tabular}
   \end{table}
@@ -599,19 +672,23 @@
 \section{Passos Futuros}
 
 \begin{frame}{Passos Futuros}
-  \begin{block}{Modelo de dinâmica completo}
+  \small
+  \begin{block}{Estender o world model offline}
     \begin{itemize}
-      \item Prever também \textbf{recompensa} e \textbf{done} por frame
-            (já disponíveis no dataset) --- fechar o world model como MDP.
+      \item Treinar por mais épocas --- fidelidade do sonho e uso do codebook
+            ainda têm bastante margem pra melhorar.
       \item Estender o horizonte de sonho e medir \emph{drift} acumulado.
     \end{itemize}
   \end{block}
 
-  \begin{block}{Aprendizado no ``sonho''}
+  \begin{block}{Aprendizado no ``sonho'' (em andamento)}
     \begin{itemize}
-      \item Treinar um \textbf{controlador} inteiramente dentro do world model
-            (à la Ha \& Schmidhuber) e transferir para o ambiente real.
-      \item Avaliar \emph{return} da política aprendida no sonho vs.\ no jogo.
+      \item Já em desenvolvimento: um \textbf{loop online} que co-treina
+            world model \emph{e} um controlador PPO \textbf{inteiramente
+            dentro do sonho} (à la Ha \& Schmidhuber / IRIS), transferindo a
+            política pro ambiente real.
+      \item Próximo passo: estabilizar esse loop em horizontes longos de
+            treino.
     \end{itemize}
   \end{block}
 
@@ -660,9 +737,9 @@
   \end{tikzpicture}}
 
   \smallskip
-  {\footnotesize O agente é treinado \textbf{inteiramente dentro do sonho} --- sem rodar o
-  jogo --- e só usa o \texttt{CarRacing} real para \emph{avaliar} a política transferida
-  (à la Ha \& Schmidhuber, 2018).}
+  {\scriptsize O agente é treinado \textbf{inteiramente dentro do sonho} --- sem rodar o
+  jogo --- e só usa o \texttt{CarRacing} real pra \emph{avaliar} a política transferida
+  (à la Ha \& Schmidhuber, 2018). Já em desenvolvimento (\texttt{train\_online.py}).}
 \end{frame}
 
 % =====================================================================
@@ -677,9 +754,7 @@
 
   \smallskip
   {\footnotesize A anima\c{c}\~ao roda no \textbf{Adobe Acrobat/Reader} (ou \texttt{pdfpc});
-  em outros leitores aparece o primeiro frame.\;
-  \textcolor{gray}{Link opcional:
-  \href{https://SEU-LINK-AQUI}{\texttt{https://SEU-LINK-AQUI}}}}
+  em outros leitores aparece o primeiro frame.}
 \end{frame}
 
 % =====================================================================
